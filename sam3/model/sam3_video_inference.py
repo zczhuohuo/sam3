@@ -59,6 +59,10 @@ class Sam3VideoInference(Sam3VideoBase):
         offload_state_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
+        long_video_mode=False,
+        long_video_history_frames=32,
+        long_video_loader_type="auto",
+        long_video_cache_outputs=False,
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
         images, orig_height, orig_width = load_resource_as_video_frames(
@@ -69,6 +73,8 @@ class Sam3VideoInference(Sam3VideoBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            long_video_mode=long_video_mode,
+            long_video_loader_type=long_video_loader_type,
         )
         inference_state = {}
         inference_state["image_size"] = self.image_size
@@ -88,6 +94,12 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["cached_frame_outputs"] = {}
         inference_state["action_history"] = []  # for logging user actions
         inference_state["is_image_only"] = is_image_type(resource_path)
+        inference_state["long_video"] = {
+            "enabled": bool(long_video_mode),
+            "history_frames": int(long_video_history_frames),
+            "loader_type": long_video_loader_type,
+            "cache_outputs": bool(long_video_cache_outputs),
+        }
         return inference_state
 
     @torch.inference_mode()

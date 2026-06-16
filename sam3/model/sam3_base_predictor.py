@@ -10,6 +10,8 @@ Subclasses only need to override methods where their behavior differs.
 """
 
 import gc
+import inspect
+import os
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -51,11 +53,24 @@ class Sam3BasePredictor:
         """Dispatch a request based on its type."""
         request_type = request["type"]
         if request_type == "start_session":
+            long_video_mode = request.get("long_video_mode", False)
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
-                offload_video_to_cpu=request.get("offload_video_to_cpu", False),
+                offload_video_to_cpu=request.get(
+                    "offload_video_to_cpu", True if long_video_mode else False
+                ),
                 offload_state_to_cpu=request.get("offload_state_to_cpu", False),
+                long_video_mode=long_video_mode,
+                long_video_history_frames=request.get(
+                    "long_video_history_frames", 32
+                ),
+                long_video_loader_type=request.get(
+                    "long_video_loader_type", "auto"
+                ),
+                long_video_cache_outputs=request.get(
+                    "long_video_cache_outputs", False
+                ),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -120,10 +135,25 @@ class Sam3BasePredictor:
         self,
         resource_path,
         session_id=None,
-        offload_video_to_cpu=False,
+        offload_video_to_cpu=None,
         offload_state_to_cpu=False,
+        long_video_mode=False,
+        long_video_history_frames=32,
+        long_video_loader_type="auto",
+        long_video_cache_outputs=False,
     ):
         """Start a new inference session on a video directory or path."""
+        if offload_video_to_cpu is None:
+            offload_video_to_cpu = bool(long_video_mode)
+        if long_video_mode:
+            if long_video_history_frames < 1:
+                raise ValueError("long_video_history_frames must be >= 1")
+            if long_video_loader_type not in {"auto", "torchcodec", "image_folder"}:
+                raise ValueError(
+                    "long_video_loader_type must be one of 'auto', 'torchcodec', "
+                    f"or 'image_folder'; got {long_video_loader_type!r}"
+                )
+
         init_kwargs = dict(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
@@ -133,7 +163,46 @@ class Sam3BasePredictor:
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
             init_kwargs["video_loader_type"] = self.video_loader_type
+        if long_video_mode:
+            init_kwargs["async_loading_frames"] = True
+            init_kwargs["long_video_mode"] = True
+            init_kwargs["long_video_history_frames"] = long_video_history_frames
+            init_kwargs["long_video_loader_type"] = long_video_loader_type
+            init_kwargs["long_video_cache_outputs"] = long_video_cache_outputs
+            if isinstance(resource_path, str):
+                if os.path.isdir(resource_path):
+                    if long_video_loader_type == "torchcodec":
+                        raise ValueError(
+                            "long_video_loader_type='torchcodec' requires a video "
+                            f"file, but got image folder {resource_path!r}"
+                        )
+                elif long_video_loader_type == "image_folder":
+                    raise ValueError(
+                        "long_video_loader_type='image_folder' requires an image "
+                        f"folder, but got {resource_path!r}"
+                    )
+                else:
+                    init_kwargs["video_loader_type"] = "torchcodec"
+
+        sig = inspect.signature(self.model.init_state)
+        has_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        if not has_var_kwargs:
+            init_kwargs = {
+                k: v for k, v in init_kwargs.items() if k in sig.parameters
+            }
         inference_state = self.model.init_state(**init_kwargs)
+        inference_state.setdefault(
+            "long_video",
+            {
+                "enabled": bool(long_video_mode),
+                "history_frames": int(long_video_history_frames),
+                "loader_type": long_video_loader_type,
+                "cache_outputs": bool(long_video_cache_outputs),
+            },
+        )
 
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -278,8 +347,6 @@ class Sam3BasePredictor:
                 max_frame_num_to_track=max_frame_num_to_track,
             )
             # Only pass output_prob_thresh / extra kwargs if the model supports them
-            import inspect
-
             sig = inspect.signature(self.model.propagate_in_video)
             if "output_prob_thresh" in sig.parameters:
                 propagate_kwargs["output_prob_thresh"] = output_prob_thresh
@@ -293,6 +360,7 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=False,
                 ):
+                    self._prune_long_video_state(inference_state, frame_idx, False)
                     yield {"frame_index": frame_idx, "outputs": outputs}
             # Backward propagation
             if propagation_direction in ["both", "backward"]:
@@ -300,9 +368,89 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=True,
                 ):
+                    self._prune_long_video_state(inference_state, frame_idx, True)
                     yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
             logger.info(f"propagation ended in session {session_id}")
+
+    def _prune_long_video_state(self, inference_state, frame_idx, reverse):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return
+        history_frames = int(long_video.get("history_frames", 32))
+        cache_outputs = bool(long_video.get("cache_outputs", False))
+
+        def should_prune(candidate_frame_idx, cond_frames):
+            if candidate_frame_idx in cond_frames:
+                return False
+            if reverse:
+                return candidate_frame_idx > frame_idx + history_frames - 1
+            return candidate_frame_idx < frame_idx - history_frames + 1
+
+        self._prune_long_video_state_dict(
+            inference_state,
+            cache_outputs=cache_outputs,
+            should_prune=should_prune,
+        )
+        for key in ("tracker_inference_states", "sam2_inference_states"):
+            for tracker_state in inference_state.get(key, []):
+                self._prune_long_video_state_dict(
+                    tracker_state,
+                    cache_outputs=cache_outputs,
+                    should_prune=should_prune,
+                )
+
+    def _prune_long_video_state_dict(
+        self,
+        state,
+        cache_outputs,
+        should_prune,
+    ):
+        output_dict = state.get("output_dict")
+        cond_frames = set()
+        pruned_frames = set()
+        if isinstance(output_dict, dict):
+            cond_frames = set(output_dict.get("cond_frame_outputs", {}).keys())
+            non_cond_outputs = output_dict.get("non_cond_frame_outputs", {})
+            for old_frame_idx in list(non_cond_outputs.keys()):
+                if should_prune(old_frame_idx, cond_frames):
+                    non_cond_outputs.pop(old_frame_idx, None)
+                    pruned_frames.add(old_frame_idx)
+
+        consolidated = state.get("consolidated_frame_inds")
+        if isinstance(consolidated, dict):
+            cond_frames.update(consolidated.get("cond_frame_outputs", set()))
+
+        if pruned_frames:
+            for per_obj_key in ("output_dict_per_obj", "temp_output_dict_per_obj"):
+                for obj_output_dict in state.get(per_obj_key, {}).values():
+                    for storage_key in (
+                        "non_cond_frame_outputs",
+                        "cond_frame_outputs",
+                    ):
+                        storage = obj_output_dict.get(storage_key, {})
+                        for old_frame_idx in pruned_frames:
+                            if old_frame_idx not in cond_frames:
+                                storage.pop(old_frame_idx, None)
+
+            frames_already_tracked = state.get("frames_already_tracked")
+            if isinstance(frames_already_tracked, dict):
+                for old_frame_idx in pruned_frames:
+                    frames_already_tracked.pop(old_frame_idx, None)
+
+        cached_frame_outputs = state.get("cached_frame_outputs")
+        if isinstance(cached_frame_outputs, dict) and not cache_outputs:
+            for old_frame_idx in list(cached_frame_outputs.keys()):
+                if should_prune(old_frame_idx, cond_frames):
+                    cached_frame_outputs.pop(old_frame_idx, None)
+
+        feature_cache = state.get("feature_cache")
+        if isinstance(feature_cache, dict):
+            for old_frame_idx in list(feature_cache.keys()):
+                if isinstance(old_frame_idx, int) and should_prune(
+                    old_frame_idx, cond_frames
+                ):
+                    feature_cache.pop(old_frame_idx, None)
 
     def reset_session(self, session_id):
         """Reset the session to its initial state."""

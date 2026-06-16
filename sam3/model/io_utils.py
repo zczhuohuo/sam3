@@ -36,6 +36,8 @@ def load_resource_as_video_frames(
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
     async_loading_frames: bool = False,
     video_loader_type: str = "cv2",
+    long_video_mode: bool = False,
+    long_video_loader_type: str = "auto",
 ) -> tuple[Any, int, int]:
     """
     Load video frames from either a video or an image (as a single-frame video).
@@ -89,6 +91,8 @@ def load_resource_as_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            long_video_mode=long_video_mode,
+            long_video_loader_type=long_video_loader_type,
         )
 
 
@@ -123,6 +127,8 @@ def load_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    long_video_mode=False,
+    long_video_loader_type="auto",
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
@@ -141,24 +147,45 @@ def load_video_frames(
         return load_dummy_video(
             image_size, offload_video_to_cpu, num_frames=num_frames, do_zeros=True
         )
-    elif os.path.isdir(video_path):
+    long_video_loader_type = long_video_loader_type or "auto"
+    if long_video_loader_type not in {"auto", "torchcodec", "image_folder"}:
+        raise ValueError(
+            "long_video_loader_type must be one of 'auto', 'torchcodec', or "
+            f"'image_folder'; got {long_video_loader_type!r}"
+        )
+
+    if os.path.isdir(video_path):
+        if long_video_mode and long_video_loader_type == "torchcodec":
+            raise ValueError(
+                "long_video_loader_type='torchcodec' requires a video file, "
+                f"but got image folder {video_path!r}"
+            )
         return load_video_frames_from_image_folder(
             image_folder=video_path,
             image_size=image_size,
             offload_video_to_cpu=offload_video_to_cpu,
             img_mean=img_mean,
             img_std=img_std,
-            async_loading_frames=async_loading_frames,
+            async_loading_frames=async_loading_frames or long_video_mode,
+            long_video_mode=long_video_mode,
         )
     elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
+        if long_video_mode and long_video_loader_type == "image_folder":
+            raise ValueError(
+                "long_video_loader_type='image_folder' requires an image folder, "
+                f"but got video file {video_path!r}"
+            )
+        if long_video_mode:
+            video_loader_type = "torchcodec"
         return load_video_frames_from_video_file(
             video_path=video_path,
             image_size=image_size,
             offload_video_to_cpu=offload_video_to_cpu,
             img_mean=img_mean,
             img_std=img_std,
-            async_loading_frames=async_loading_frames,
+            async_loading_frames=async_loading_frames or long_video_mode,
             video_loader_type=video_loader_type,
+            long_video_mode=long_video_mode,
         )
     else:
         # No recognized extension (e.g., extensionless OIL paths) — attempt video loading.
@@ -170,8 +197,9 @@ def load_video_frames(
                 offload_video_to_cpu=offload_video_to_cpu,
                 img_mean=img_mean,
                 img_std=img_std,
-                async_loading_frames=async_loading_frames,
-                video_loader_type=video_loader_type,
+                async_loading_frames=async_loading_frames or long_video_mode,
+                video_loader_type="torchcodec" if long_video_mode else video_loader_type,
+                long_video_mode=long_video_mode,
             )
         except Exception as e:
             raise NotImplementedError(
@@ -187,6 +215,7 @@ def load_video_frames_from_image_folder(
     img_mean,
     img_std,
     async_loading_frames,
+    long_video_mode=False,
 ):
     """
     Load the video frames from a directory of image files ("<frame_index>.<img_ext>" format)
@@ -211,6 +240,12 @@ def load_video_frames_from_image_folder(
     img_paths = [os.path.join(image_folder, frame_name) for frame_name in frame_names]
     img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+
+    if long_video_mode:
+        lazy_images = LazyImageFrameLoader(
+            img_paths, image_size, offload_video_to_cpu, img_mean, img_std
+        )
+        return lazy_images, lazy_images.video_height, lazy_images.video_width
 
     if async_loading_frames:
         lazy_images = AsyncImageFrameLoader(
@@ -245,8 +280,14 @@ def load_video_frames_from_video_file(
     gpu_acceleration=False,
     gpu_device=None,
     video_loader_type="cv2",
+    long_video_mode=False,
 ):
     """Load the video frames from a video file."""
+    if long_video_mode and video_loader_type != "torchcodec":
+        raise ValueError(
+            "long_video_mode requires TorchCodec for video files to avoid "
+            "materializing the entire video with cv2"
+        )
     if video_loader_type == "cv2":
         return load_video_frames_from_video_file_using_cv2(
             video_path=video_path,
@@ -257,6 +298,17 @@ def load_video_frames_from_video_file(
         )
     elif video_loader_type == "torchcodec":
         logger.info("Using torchcodec to load video file")
+        if long_video_mode:
+            lazy_images = LazyVideoFileLoaderWithTorchCodec(
+                video_path=video_path,
+                image_size=image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                img_mean=img_mean,
+                img_std=img_std,
+                gpu_acceleration=gpu_acceleration,
+                gpu_device=gpu_device,
+            )
+            return lazy_images, lazy_images.video_height, lazy_images.video_width
         lazy_images = AsyncVideoFileLoaderWithTorchCodec(
             video_path=video_path,
             image_size=image_size,
@@ -410,6 +462,13 @@ class AsyncImageFrameLoader:
         self.thread.start()
 
     def __getitem__(self, index):
+        if isinstance(index, torch.Tensor):
+            index = index.tolist()
+        if isinstance(index, slice):
+            return torch.stack([self[i] for i in range(*index.indices(len(self)))])
+        if isinstance(index, list):
+            return torch.stack([self[i] for i in index])
+
         if self.exception is not None:
             raise RuntimeError("Failure in frame loading thread") from self.exception
 
@@ -434,6 +493,86 @@ class AsyncImageFrameLoader:
 
     def __len__(self) -> int:
         return len(self.images)
+
+    @property
+    def tensors(self):
+        return self
+
+
+class LazyImageFrameLoader:
+    """
+    Image-folder frame store for long-video mode.
+
+    Unlike AsyncImageFrameLoader, this does not start a background thread that
+    eventually fills the whole video in memory.
+    """
+
+    def __init__(
+        self,
+        img_paths,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        max_cached_frames=2,
+    ):
+        self.img_paths = img_paths
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.img_mean = img_mean
+        self.img_std = img_std
+        self.max_cached_frames = max_cached_frames
+        self.cache = {}
+        self.cache_order = []
+        self.video_height = None
+        self.video_width = None
+        first_img = self[0]
+        del first_img
+
+    def __getitem__(self, index):
+        if isinstance(index, torch.Tensor):
+            index = index.tolist()
+        if isinstance(index, slice):
+            return torch.stack([self[i] for i in range(*index.indices(len(self)))])
+        if isinstance(index, list):
+            return torch.stack([self[i] for i in index])
+        if index < 0:
+            index += len(self.img_paths)
+        if index >= len(self.img_paths) or index < 0:
+            raise IndexError(
+                f"Index {index} is out of bounds; length is {len(self.img_paths)}"
+            )
+        cached = self.cache.get(index)
+        if cached is not None:
+            return cached
+        img, video_height, video_width = _load_img_as_tensor(
+            self.img_paths[index], self.image_size
+        )
+        self.video_height = video_height
+        self.video_width = video_width
+        img = img.to(dtype=torch.float16)
+        img -= self.img_mean
+        img /= self.img_std
+        if not self.offload_video_to_cpu:
+            img = img.cuda()
+        self._cache_frame(index, img)
+        return img
+
+    def _cache_frame(self, index, img):
+        if self.max_cached_frames <= 0:
+            return
+        self.cache[index] = img
+        self.cache_order.append(index)
+        while len(self.cache_order) > self.max_cached_frames:
+            old_index = self.cache_order.pop(0)
+            self.cache.pop(old_index, None)
+
+    def __len__(self) -> int:
+        return len(self.img_paths)
+
+    @property
+    def tensors(self):
+        return self
 
 
 class TorchCodecDecoder:
@@ -492,6 +631,130 @@ class TorchCodecDecoder:
             frame_index=key,
         )
         return frame_data
+
+
+class LazyVideoFileLoaderWithTorchCodec:
+    """
+    TorchCodec-backed frame store for long-video mode.
+
+    This intentionally does not preallocate a [T, C, H, W] tensor. Frames are
+    decoded and normalized on demand, with a tiny cache for repeated prompt or
+    propagation access around the current frame.
+    """
+
+    def __init__(
+        self,
+        video_path: str,
+        image_size: int,
+        offload_video_to_cpu: bool,
+        img_mean: Union[tuple[float, float, float], torch.Tensor],
+        img_std: Union[tuple[float, float, float], torch.Tensor],
+        gpu_acceleration: bool = False,
+        gpu_device: Optional[torch.device] = None,
+        max_cached_frames: int = 2,
+    ) -> None:
+        assert gpu_device is None or gpu_device.type == "cuda"
+        if gpu_device is not None and gpu_device.index is not None:
+            gpu_id = gpu_device.index
+        elif gpu_acceleration:
+            gpu_id = torch.cuda.current_device()
+        else:
+            gpu_id = 0
+        self.out_device = (
+            torch.device("cpu")
+            if offload_video_to_cpu
+            else torch.device("cuda") if gpu_device is None else gpu_device
+        )
+        self.gpu_acceleration = gpu_acceleration
+        self.gpu_id = gpu_id
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.max_cached_frames = max_cached_frames
+        self.cache = {}
+        self.cache_order = []
+        self.torchcodec_access_lock = FIFOLock()
+
+        if not isinstance(img_mean, torch.Tensor):
+            img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+        if not isinstance(img_std, torch.Tensor):
+            img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+        if gpu_acceleration:
+            self.img_mean = img_mean.to(f"cuda:{self.gpu_id}")
+            self.img_std = img_std.to(f"cuda:{self.gpu_id}")
+            decoder_option = {"device": f"cuda:{self.gpu_id}"}
+        else:
+            self.img_mean = img_mean.cpu()
+            self.img_std = img_std.cpu()
+            decoder_option = {"num_threads": 1}
+
+        try:
+            self.reader = TorchCodecDecoder(video_path, **decoder_option)
+        except ImportError as exc:
+            raise RuntimeError(
+                "long_video_mode for video files requires TorchCodec. "
+                "Install torchcodec or use an image-folder input."
+            ) from exc
+        self.num_frames = len(self.reader)
+        self.video_height = self.reader.metadata.height
+        self.video_width = self.reader.metadata.width
+
+    @property
+    def tensors(self):
+        return self
+
+    def __len__(self) -> int:
+        return self.num_frames
+
+    def __getitem__(self, index):
+        if isinstance(index, torch.Tensor):
+            index = index.tolist()
+        if isinstance(index, slice):
+            return torch.stack([self[i] for i in range(*index.indices(len(self)))])
+        if isinstance(index, list):
+            return torch.stack([self[i] for i in index])
+        if index < 0:
+            index += self.num_frames
+        if index >= self.num_frames or index < 0:
+            raise IndexError(
+                f"Index {index} is out of bounds; length is {self.num_frames}"
+            )
+        cached = self.cache.get(index)
+        if cached is not None:
+            return cached
+        with self.torchcodec_access_lock:
+            cached = self.cache.get(index)
+            if cached is not None:
+                return cached
+            frame = self._transform_frame(self.reader[index])
+            self._cache_frame(index, frame)
+            return frame
+
+    def _cache_frame(self, index: int, frame: torch.Tensor) -> None:
+        if self.max_cached_frames <= 0:
+            return
+        self.cache[index] = frame
+        self.cache_order.append(index)
+        while len(self.cache_order) > self.max_cached_frames:
+            old_index = self.cache_order.pop(0)
+            self.cache.pop(old_index, None)
+
+    def _transform_frame(self, frame):
+        frame = frame.clone().float()
+        frame_resized = F.interpolate(
+            frame[None, :],
+            size=(self.image_size, self.image_size),
+            mode="bicubic",
+            align_corners=False,
+        )[0]
+        frame_resized = frame_resized.half()
+        frame_resized /= 255
+        frame_resized -= self.img_mean
+        frame_resized /= self.img_std
+        if self.offload_video_to_cpu:
+            frame_resized = frame_resized.cpu()
+        elif frame_resized.device != self.out_device:
+            frame_resized = frame_resized.to(device=self.out_device, non_blocking=True)
+        return frame_resized
 
 
 class FIFOLock:
