@@ -8,7 +8,8 @@ import queue
 import re
 import time
 import types
-from threading import Condition, get_ident, Lock, Thread
+import weakref
+from threading import Condition, Event, get_ident, Lock, Thread
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -36,6 +37,8 @@ def load_resource_as_video_frames(
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
     async_loading_frames: bool = False,
     video_loader_type: str = "cv2",
+    long_video_mode: bool = False,
+    long_video_loader_type: str = "auto",
 ) -> tuple[Any, int, int]:
     """
     Load video frames from either a video or an image (as a single-frame video).
@@ -89,6 +92,8 @@ def load_resource_as_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            long_video_mode=long_video_mode,
+            long_video_loader_type=long_video_loader_type,
         )
 
 
@@ -123,6 +128,8 @@ def load_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    long_video_mode=False,
+    long_video_loader_type="auto",
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
@@ -141,24 +148,45 @@ def load_video_frames(
         return load_dummy_video(
             image_size, offload_video_to_cpu, num_frames=num_frames, do_zeros=True
         )
-    elif os.path.isdir(video_path):
+    long_video_loader_type = long_video_loader_type or "auto"
+    if long_video_loader_type not in {"auto", "torchcodec", "image_folder"}:
+        raise ValueError(
+            "long_video_loader_type must be one of 'auto', 'torchcodec', or "
+            f"'image_folder'; got {long_video_loader_type!r}"
+        )
+
+    if os.path.isdir(video_path):
+        if long_video_mode and long_video_loader_type == "torchcodec":
+            raise ValueError(
+                "long_video_loader_type='torchcodec' requires a video file, "
+                f"but got image folder {video_path!r}"
+            )
         return load_video_frames_from_image_folder(
             image_folder=video_path,
             image_size=image_size,
             offload_video_to_cpu=offload_video_to_cpu,
             img_mean=img_mean,
             img_std=img_std,
-            async_loading_frames=async_loading_frames,
+            async_loading_frames=async_loading_frames or long_video_mode,
+            long_video_mode=long_video_mode,
         )
     elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
+        if long_video_mode and long_video_loader_type == "image_folder":
+            raise ValueError(
+                "long_video_loader_type='image_folder' requires an image folder, "
+                f"but got video file {video_path!r}"
+            )
+        if long_video_mode:
+            video_loader_type = "torchcodec"
         return load_video_frames_from_video_file(
             video_path=video_path,
             image_size=image_size,
             offload_video_to_cpu=offload_video_to_cpu,
             img_mean=img_mean,
             img_std=img_std,
-            async_loading_frames=async_loading_frames,
+            async_loading_frames=async_loading_frames or long_video_mode,
             video_loader_type=video_loader_type,
+            long_video_mode=long_video_mode,
         )
     else:
         # No recognized extension (e.g., extensionless OIL paths) — attempt video loading.
@@ -170,8 +198,9 @@ def load_video_frames(
                 offload_video_to_cpu=offload_video_to_cpu,
                 img_mean=img_mean,
                 img_std=img_std,
-                async_loading_frames=async_loading_frames,
-                video_loader_type=video_loader_type,
+                async_loading_frames=async_loading_frames or long_video_mode,
+                video_loader_type="torchcodec" if long_video_mode else video_loader_type,
+                long_video_mode=long_video_mode,
             )
         except Exception as e:
             raise NotImplementedError(
@@ -187,6 +216,7 @@ def load_video_frames_from_image_folder(
     img_mean,
     img_std,
     async_loading_frames,
+    long_video_mode=False,
 ):
     """
     Load the video frames from a directory of image files ("<frame_index>.<img_ext>" format)
@@ -211,6 +241,12 @@ def load_video_frames_from_image_folder(
     img_paths = [os.path.join(image_folder, frame_name) for frame_name in frame_names]
     img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+
+    if long_video_mode:
+        lazy_images = LazyImageFrameLoader(
+            img_paths, image_size, offload_video_to_cpu, img_mean, img_std
+        )
+        return lazy_images, lazy_images.video_height, lazy_images.video_width
 
     if async_loading_frames:
         lazy_images = AsyncImageFrameLoader(
@@ -245,8 +281,14 @@ def load_video_frames_from_video_file(
     gpu_acceleration=False,
     gpu_device=None,
     video_loader_type="cv2",
+    long_video_mode=False,
 ):
     """Load the video frames from a video file."""
+    if long_video_mode and video_loader_type != "torchcodec":
+        raise ValueError(
+            "long_video_mode requires TorchCodec for video files to avoid "
+            "materializing the entire video with cv2"
+        )
     if video_loader_type == "cv2":
         return load_video_frames_from_video_file_using_cv2(
             video_path=video_path,
@@ -257,6 +299,17 @@ def load_video_frames_from_video_file(
         )
     elif video_loader_type == "torchcodec":
         logger.info("Using torchcodec to load video file")
+        if long_video_mode:
+            lazy_images = LazyVideoFileLoaderWithTorchCodec(
+                video_path=video_path,
+                image_size=image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                img_mean=img_mean,
+                img_std=img_std,
+                gpu_acceleration=gpu_acceleration,
+                gpu_device=gpu_device,
+            )
+            return lazy_images, lazy_images.video_height, lazy_images.video_width
         lazy_images = AsyncVideoFileLoaderWithTorchCodec(
             video_path=video_path,
             image_size=image_size,
@@ -410,6 +463,13 @@ class AsyncImageFrameLoader:
         self.thread.start()
 
     def __getitem__(self, index):
+        if isinstance(index, torch.Tensor):
+            index = index.tolist()
+        if isinstance(index, slice):
+            return torch.stack([self[i] for i in range(*index.indices(len(self)))])
+        if isinstance(index, list):
+            return torch.stack([self[i] for i in index])
+
         if self.exception is not None:
             raise RuntimeError("Failure in frame loading thread") from self.exception
 
@@ -434,6 +494,216 @@ class AsyncImageFrameLoader:
 
     def __len__(self) -> int:
         return len(self.images)
+
+    @property
+    def tensors(self):
+        return self
+
+
+class _BoundedPrefetchFrameStore:
+    """
+    Mixin: bounded LRU frame cache + background sliding-window prefetch thread.
+
+    Long-video mode decodes frames on demand instead of materializing the whole
+    [T, C, H, W] tensor. A small prefetch thread decodes a window of frames ahead
+    of the most recent request so frame I/O overlaps GPU compute (recovering the
+    overlap the synchronous lazy loader gave up), while the LRU cache keeps peak
+    memory bounded at O(prefetch_window + keep_behind).
+
+    Subclasses must call ``_init_prefetch(...)``, set ``self._num_frames``,
+    implement ``_decode_frame(index) -> torch.Tensor``, and call
+    ``_start_prefetch()`` once the first frame is decoded.
+    """
+
+    def _init_prefetch(self, prefetch_window=8, keep_behind=2, decode_lock=None):
+        self.prefetch_window = max(int(prefetch_window), 0)
+        self.keep_behind = max(int(keep_behind), 0)
+        self.capacity = self.prefetch_window + self.keep_behind + 2
+        self.cache = {}
+        self.cache_order = []
+        self.exception = None
+        self._num_frames = 0
+        self._decode_lock = decode_lock if decode_lock is not None else FIFOLock()
+        self._cache_lock = Lock()
+        self._current_index = 0
+        self._direction = 1
+        self._wake = Event()
+        self._stop = Event()
+        self._thread = None
+
+    def _start_prefetch(self):
+        if self.prefetch_window <= 0 or self._thread is not None:
+            return
+        # The thread holds only a weakref to self (plus the two small events), so
+        # it does not keep the loader alive; it exits within ~1s of the loader
+        # being dropped or close()d.
+        self._thread = Thread(
+            target=self._prefetch_main,
+            args=(weakref.ref(self), self._stop, self._wake),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    @property
+    def tensors(self):
+        return self
+
+    def __getitem__(self, index):
+        if isinstance(index, torch.Tensor):
+            index = index.tolist()
+        if isinstance(index, slice):
+            return torch.stack([self[i] for i in range(*index.indices(len(self)))])
+        if isinstance(index, list):
+            return torch.stack([self[i] for i in index])
+        if index < 0:
+            index += self._num_frames
+        if index < 0 or index >= self._num_frames:
+            raise IndexError(
+                f"Index {index} is out of bounds; length is {self._num_frames}"
+            )
+        prev = self._current_index
+        self._current_index = index
+        if index != prev:
+            self._direction = 1 if index >= prev else -1
+        self._wake.set()
+        return self._get(index)
+
+    def _get(self, index):
+        frame = self._cache_get(index)
+        if frame is not None:
+            return frame
+        if self.exception is not None:
+            raise RuntimeError("Failure in frame prefetch thread") from self.exception
+        with self._decode_lock:
+            frame = self._cache_get(index)
+            if frame is not None:
+                return frame
+            frame = self._decode_frame(index)
+            self._cache_put(index, frame)
+            return frame
+
+    def _cache_get(self, index):
+        with self._cache_lock:
+            frame = self.cache.get(index)
+            if frame is not None:
+                try:
+                    self.cache_order.remove(index)
+                except ValueError:
+                    pass
+                self.cache_order.append(index)
+            return frame
+
+    def _cache_put(self, index, frame):
+        if self.capacity <= 0:
+            return
+        with self._cache_lock:
+            self.cache[index] = frame
+            try:
+                self.cache_order.remove(index)
+            except ValueError:
+                pass
+            self.cache_order.append(index)
+            while len(self.cache_order) > self.capacity:
+                old_index = self.cache_order.pop(0)
+                self.cache.pop(old_index, None)
+
+    @staticmethod
+    def _prefetch_main(self_ref, stop, wake):
+        while not stop.is_set():
+            if not wake.wait(timeout=1.0):
+                continue
+            wake.clear()
+            if stop.is_set():
+                return
+            store = self_ref()
+            if store is None:
+                return
+            try:
+                store._prefetch_window_once()
+            except Exception as exc:  # surfaced on the next __getitem__
+                store.exception = exc
+                return
+            del store
+
+    def _prefetch_window_once(self):
+        start = self._current_index
+        step = self._direction or 1
+        decoded = 0
+        i = start + step
+        while 0 <= i < self._num_frames and decoded < self.prefetch_window:
+            if self._stop.is_set():
+                return
+            # If the consumer jumped elsewhere, abandon this window and re-arm.
+            if self._current_index != start:
+                self._wake.set()
+                return
+            if self._cache_get(i) is None:
+                with self._decode_lock:
+                    if self._cache_get(i) is None:
+                        self._cache_put(i, self._decode_frame(i))
+            i += step
+            decoded += 1
+
+    def _decode_frame(self, index):  # pragma: no cover - implemented by subclasses
+        raise NotImplementedError
+
+    def close(self):
+        self._stop.set()
+        self._wake.set()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class LazyImageFrameLoader(_BoundedPrefetchFrameStore):
+    """
+    Image-folder frame store for long-video mode.
+
+    Unlike AsyncImageFrameLoader, this never materializes the whole video; it
+    keeps a bounded LRU cache and prefetches a small window ahead of the cursor.
+    """
+
+    def __init__(
+        self,
+        img_paths,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        prefetch_window=8,
+        keep_behind=2,
+    ):
+        self._init_prefetch(prefetch_window, keep_behind)
+        self.img_paths = img_paths
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.img_mean = img_mean
+        self.img_std = img_std
+        self.video_height = None
+        self.video_width = None
+        self._num_frames = len(img_paths)
+        # decode the first frame eagerly to fill video_height/width and warm cache
+        self._cache_put(0, self._decode_frame(0))
+        self._start_prefetch()
+
+    def _decode_frame(self, index):
+        img, video_height, video_width = _load_img_as_tensor(
+            self.img_paths[index], self.image_size
+        )
+        self.video_height = video_height
+        self.video_width = video_width
+        img = img.to(dtype=torch.float16)
+        img -= self.img_mean
+        img /= self.img_std
+        if not self.offload_video_to_cpu:
+            img = img.cuda()
+        return img
 
 
 class TorchCodecDecoder:
@@ -492,6 +762,99 @@ class TorchCodecDecoder:
             frame_index=key,
         )
         return frame_data
+
+
+class LazyVideoFileLoaderWithTorchCodec(_BoundedPrefetchFrameStore):
+    """
+    TorchCodec-backed frame store for long-video mode.
+
+    This intentionally does not preallocate a [T, C, H, W] tensor. Frames are
+    decoded and normalized on demand, with a bounded LRU cache and a small
+    sliding-window prefetch thread so decode overlaps GPU compute. TorchCodec
+    access is serialized through the prefetch store's FIFO decode lock.
+    """
+
+    def __init__(
+        self,
+        video_path: str,
+        image_size: int,
+        offload_video_to_cpu: bool,
+        img_mean: Union[tuple[float, float, float], torch.Tensor],
+        img_std: Union[tuple[float, float, float], torch.Tensor],
+        gpu_acceleration: bool = False,
+        gpu_device: Optional[torch.device] = None,
+        prefetch_window: int = 8,
+        keep_behind: int = 2,
+    ) -> None:
+        assert gpu_device is None or gpu_device.type == "cuda"
+        self._init_prefetch(prefetch_window, keep_behind)
+        if gpu_device is not None and gpu_device.index is not None:
+            gpu_id = gpu_device.index
+        elif gpu_acceleration:
+            gpu_id = torch.cuda.current_device()
+        else:
+            gpu_id = 0
+        self.out_device = (
+            torch.device("cpu")
+            if offload_video_to_cpu
+            else torch.device("cuda") if gpu_device is None else gpu_device
+        )
+        self.gpu_acceleration = gpu_acceleration
+        self.gpu_id = gpu_id
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+
+        if not isinstance(img_mean, torch.Tensor):
+            img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+        if not isinstance(img_std, torch.Tensor):
+            img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+        if gpu_acceleration:
+            self.img_mean = img_mean.to(f"cuda:{self.gpu_id}")
+            self.img_std = img_std.to(f"cuda:{self.gpu_id}")
+            decoder_option = {"device": f"cuda:{self.gpu_id}"}
+        else:
+            self.img_mean = img_mean.cpu()
+            self.img_std = img_std.cpu()
+            decoder_option = {"num_threads": 1}
+
+        try:
+            self.reader = TorchCodecDecoder(video_path, **decoder_option)
+        except ImportError as exc:
+            raise RuntimeError(
+                "long_video_mode for video files requires TorchCodec. "
+                "Install torchcodec or use an image-folder input."
+            ) from exc
+        self._num_frames = len(self.reader)
+        self.video_height = self.reader.metadata.height
+        self.video_width = self.reader.metadata.width
+        # decode the first frame eagerly to warm the cache, then start prefetch
+        self._cache_put(0, self._decode_frame(0))
+        self._start_prefetch()
+
+    @property
+    def num_frames(self) -> int:
+        return self._num_frames
+
+    def _decode_frame(self, index):
+        return self._transform_frame(self.reader[index])
+
+    def _transform_frame(self, frame):
+        frame = frame.clone().float()
+        frame_resized = F.interpolate(
+            frame[None, :],
+            size=(self.image_size, self.image_size),
+            mode="bicubic",
+            align_corners=False,
+        )[0]
+        frame_resized = frame_resized.half()
+        frame_resized /= 255
+        frame_resized -= self.img_mean
+        frame_resized /= self.img_std
+        if self.offload_video_to_cpu:
+            frame_resized = frame_resized.cpu()
+        elif frame_resized.device != self.out_device:
+            frame_resized = frame_resized.to(device=self.out_device, non_blocking=True)
+        return frame_resized
 
 
 class FIFOLock:

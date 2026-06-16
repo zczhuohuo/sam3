@@ -10,6 +10,8 @@ Subclasses only need to override methods where their behavior differs.
 """
 
 import gc
+import inspect
+import os
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -51,11 +53,39 @@ class Sam3BasePredictor:
         """Dispatch a request based on its type."""
         request_type = request["type"]
         if request_type == "start_session":
+            long_video_mode = request.get("long_video_mode", False)
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
-                offload_video_to_cpu=request.get("offload_video_to_cpu", False),
+                offload_video_to_cpu=request.get(
+                    "offload_video_to_cpu", True if long_video_mode else False
+                ),
                 offload_state_to_cpu=request.get("offload_state_to_cpu", False),
+                long_video_mode=long_video_mode,
+                long_video_history_frames=request.get(
+                    "long_video_history_frames", 32
+                ),
+                long_video_loader_type=request.get(
+                    "long_video_loader_type", "auto"
+                ),
+                long_video_cache_outputs=request.get(
+                    "long_video_cache_outputs", False
+                ),
+                long_video_postprocess_batch_size=request.get(
+                    "long_video_postprocess_batch_size", None
+                ),
+                long_video_grounding_batch_size=request.get(
+                    "long_video_grounding_batch_size", None
+                ),
+                long_video_offload_lookback_frames=request.get(
+                    "long_video_offload_lookback_frames", None
+                ),
+                long_video_disable_temporal_disambiguation=request.get(
+                    "long_video_disable_temporal_disambiguation", False
+                ),
+                long_video_num_maskmem=request.get("long_video_num_maskmem", None),
+                long_video_max_obj_ptrs=request.get("long_video_max_obj_ptrs", None),
+                long_video_compile=request.get("long_video_compile", False),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -120,10 +150,40 @@ class Sam3BasePredictor:
         self,
         resource_path,
         session_id=None,
-        offload_video_to_cpu=False,
+        offload_video_to_cpu=None,
         offload_state_to_cpu=False,
+        long_video_mode=False,
+        long_video_history_frames=32,
+        long_video_loader_type="auto",
+        long_video_cache_outputs=False,
+        long_video_postprocess_batch_size=None,
+        long_video_grounding_batch_size=None,
+        long_video_offload_lookback_frames=None,
+        long_video_disable_temporal_disambiguation=False,
+        long_video_num_maskmem=None,
+        long_video_max_obj_ptrs=None,
+        long_video_compile=False,
     ):
         """Start a new inference session on a video directory or path."""
+        if offload_video_to_cpu is None:
+            offload_video_to_cpu = bool(long_video_mode)
+        if long_video_mode:
+            if long_video_history_frames < 1:
+                raise ValueError("long_video_history_frames must be >= 1")
+            if long_video_loader_type not in {"auto", "torchcodec", "image_folder"}:
+                raise ValueError(
+                    "long_video_loader_type must be one of 'auto', 'torchcodec', "
+                    f"or 'image_folder'; got {long_video_loader_type!r}"
+                )
+            if (
+                long_video_offload_lookback_frames is not None
+                and int(long_video_offload_lookback_frames) < long_video_history_frames
+            ):
+                raise ValueError(
+                    "long_video_offload_lookback_frames must be >= "
+                    "long_video_history_frames"
+                )
+
         init_kwargs = dict(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
@@ -133,7 +193,70 @@ class Sam3BasePredictor:
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
             init_kwargs["video_loader_type"] = self.video_loader_type
+        if long_video_mode:
+            init_kwargs["async_loading_frames"] = True
+            init_kwargs["long_video_mode"] = True
+            init_kwargs["long_video_history_frames"] = long_video_history_frames
+            init_kwargs["long_video_loader_type"] = long_video_loader_type
+            init_kwargs["long_video_cache_outputs"] = long_video_cache_outputs
+            init_kwargs[
+                "long_video_postprocess_batch_size"
+            ] = long_video_postprocess_batch_size
+            init_kwargs["long_video_grounding_batch_size"] = (
+                long_video_grounding_batch_size
+            )
+            if isinstance(resource_path, str):
+                if os.path.isdir(resource_path):
+                    if long_video_loader_type == "torchcodec":
+                        raise ValueError(
+                            "long_video_loader_type='torchcodec' requires a video "
+                            f"file, but got image folder {resource_path!r}"
+                        )
+                elif long_video_loader_type == "image_folder":
+                    raise ValueError(
+                        "long_video_loader_type='image_folder' requires an image "
+                        f"folder, but got {resource_path!r}"
+                    )
+                else:
+                    init_kwargs["video_loader_type"] = "torchcodec"
+
+        sig = inspect.signature(self.model.init_state)
+        has_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        if not has_var_kwargs:
+            init_kwargs = {
+                k: v for k, v in init_kwargs.items() if k in sig.parameters
+            }
+        if long_video_mode and long_video_compile:
+            self._maybe_compile_model()
+
         inference_state = self.model.init_state(**init_kwargs)
+        inference_state.setdefault(
+            "long_video",
+            {
+                "enabled": bool(long_video_mode),
+                "history_frames": int(long_video_history_frames),
+                "loader_type": long_video_loader_type,
+                "cache_outputs": bool(long_video_cache_outputs),
+                "postprocess_batch_size": long_video_postprocess_batch_size,
+                "grounding_batch_size": long_video_grounding_batch_size,
+            },
+        )
+        if long_video_mode:
+            # Predictor-controlled runtime knobs (consumed in propagate_in_video).
+            long_video_state = inference_state["long_video"]
+            long_video_state["offload_lookback_frames"] = (
+                int(long_video_offload_lookback_frames)
+                if long_video_offload_lookback_frames is not None
+                else None
+            )
+            long_video_state["disable_temporal_disambiguation"] = bool(
+                long_video_disable_temporal_disambiguation
+            )
+            long_video_state["num_maskmem"] = long_video_num_maskmem
+            long_video_state["max_obj_ptrs"] = long_video_max_obj_ptrs
 
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -266,6 +389,9 @@ class Sam3BasePredictor:
         try:
             session = self._get_session(session_id)
             inference_state = session["state"]
+            restore_runtime_overrides = self._apply_long_video_runtime_overrides(
+                inference_state
+            )
             self._extend_expiration_time(session)
             if propagation_direction not in ["both", "forward", "backward"]:
                 raise ValueError(
@@ -278,8 +404,6 @@ class Sam3BasePredictor:
                 max_frame_num_to_track=max_frame_num_to_track,
             )
             # Only pass output_prob_thresh / extra kwargs if the model supports them
-            import inspect
-
             sig = inspect.signature(self.model.propagate_in_video)
             if "output_prob_thresh" in sig.parameters:
                 propagate_kwargs["output_prob_thresh"] = output_prob_thresh
@@ -293,6 +417,14 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=False,
                 ):
+                    self._maintain_long_video_active_objects(
+                        inference_state,
+                        frame_idx,
+                        outputs,
+                        False,
+                        output_prob_thresh,
+                    )
+                    self._prune_long_video_state(inference_state, frame_idx, False)
                     yield {"frame_index": frame_idx, "outputs": outputs}
             # Backward propagation
             if propagation_direction in ["both", "backward"]:
@@ -300,9 +432,493 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=True,
                 ):
+                    self._maintain_long_video_active_objects(
+                        inference_state,
+                        frame_idx,
+                        outputs,
+                        True,
+                        output_prob_thresh,
+                    )
+                    self._prune_long_video_state(inference_state, frame_idx, True)
                     yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
+            if "restore_runtime_overrides" in locals():
+                restore_runtime_overrides()
             logger.info(f"propagation ended in session {session_id}")
+
+    def _maybe_compile_model(self):
+        """Opt-in torch.compile for long-video sessions (C6).
+
+        Compiles the shared model once; later sessions reuse the compiled graphs.
+        Best-effort: a compilation failure logs and falls back to eager mode.
+        """
+        if getattr(self.model, "_model_is_compiled", False):
+            return
+        if not hasattr(self.model, "_compile_model"):
+            logger.warning(
+                "long_video_compile requested but model has no _compile_model()"
+            )
+            return
+        try:
+            self.model.compile_model = True
+            if hasattr(self.model, "detector"):
+                self.model.detector.compile_model = True
+            self.model._compile_model()
+            logger.info("long_video_compile: torch.compile enabled on shared model")
+        except Exception as exc:  # compilation is best-effort
+            logger.warning(
+                f"long_video_compile failed; continuing without compile: {exc}"
+            )
+
+    def _apply_long_video_runtime_overrides(self, inference_state):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return lambda: None
+
+        original_values = {}
+
+        def override_attr(attr_name, value, *, mode):
+            # mode="min": only shrink an existing numeric knob (memory/throughput
+            # tradeoff). mode="set": replace outright (e.g. boolean toggles).
+            if value is None or not hasattr(self.model, attr_name):
+                return
+            if attr_name in original_values:
+                return
+            current = getattr(self.model, attr_name)
+            if mode == "min":
+                value = int(value)
+                if value < 1:
+                    return
+                new_value = min(current, value) if current is not None else value
+            else:
+                new_value = value
+            if new_value == current:
+                return
+            original_values[attr_name] = current
+            setattr(self.model, attr_name, new_value)
+
+        # C8 — batch sizes: trade throughput for peak memory (only lower on OOM).
+        override_attr(
+            "postprocess_batch_size",
+            long_video.get("postprocess_batch_size"),
+            mode="min",
+        )
+        override_attr(
+            "batched_grounding_batch_size",
+            long_video.get("grounding_batch_size"),
+            mode="min",
+        )
+
+        # C7 — shrink the real memory-attention lookback. Disabling temporal
+        # disambiguation bounds frame_filter to ~max_obj_ptrs_in_encoder frames,
+        # which (with a matching history_frames) makes pruning lossless and also
+        # cuts compute. Shrinking num_maskmem / max_obj_ptrs reduces both memory
+        # and per-frame attention cost at a small accuracy cost.
+        if long_video.get("disable_temporal_disambiguation", False):
+            override_attr("use_memory_selection", False, mode="set")
+        override_attr(
+            "num_maskmem", long_video.get("num_maskmem"), mode="min"
+        )
+        override_attr(
+            "max_obj_ptrs_in_encoder", long_video.get("max_obj_ptrs"), mode="min"
+        )
+
+        def restore():
+            for attr_name, original_value in original_values.items():
+                setattr(self.model, attr_name, original_value)
+
+        return restore
+
+    def _maintain_long_video_active_objects(
+        self, inference_state, frame_idx, outputs, reverse, output_prob_thresh
+    ):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return
+        if long_video.get("active_window_managed_in_model", False):
+            return
+        if not hasattr(self.model, "remove_object"):
+            return
+
+        tracker_metadata = inference_state.get("tracker_metadata")
+        if not isinstance(tracker_metadata, dict):
+            return
+
+        tracked_obj_ids = self._normalize_long_video_obj_ids(
+            tracker_metadata.get("obj_ids_all_gpu")
+        )
+        if not tracked_obj_ids:
+            return
+
+        history_frames = int(long_video.get("history_frames", 32))
+        first_seen = long_video.setdefault("object_first_seen_frame", {})
+        last_output = long_video.setdefault("object_last_output_frame", {})
+        removed = long_video.setdefault("removed_inactive_object_ids", set())
+
+        for obj_id in tracked_obj_ids:
+            if obj_id not in removed:
+                first_seen.setdefault(obj_id, frame_idx)
+
+        valid_output_obj_ids = self._extract_long_video_valid_output_obj_ids(
+            inference_state, frame_idx, outputs, output_prob_thresh
+        )
+        for obj_id in valid_output_obj_ids:
+            if obj_id not in removed:
+                first_seen.setdefault(obj_id, frame_idx)
+                last_output[obj_id] = frame_idx
+
+        stale_obj_ids = []
+        for obj_id in tracked_obj_ids:
+            if obj_id in removed:
+                continue
+            reference_frame = last_output.get(obj_id, first_seen.get(obj_id, frame_idx))
+            if self._long_video_object_is_stale(
+                reference_frame, frame_idx, history_frames, reverse
+            ):
+                stale_obj_ids.append(obj_id)
+
+        for obj_id in stale_obj_ids:
+            self.model.remove_object(
+                inference_state,
+                obj_id,
+                frame_idx=None,
+                is_user_action=False,
+            )
+            removed.add(obj_id)
+            first_seen.pop(obj_id, None)
+            last_output.pop(obj_id, None)
+
+    def _long_video_object_is_stale(
+        self, reference_frame, frame_idx, history_frames, reverse
+    ):
+        if reverse:
+            return reference_frame > frame_idx + history_frames - 1
+        return reference_frame < frame_idx - history_frames + 1
+
+    def _extract_long_video_output_obj_ids(self, outputs):
+        if not isinstance(outputs, dict):
+            return []
+        return self._normalize_long_video_obj_ids(outputs.get("out_obj_ids"))
+
+    def _extract_long_video_valid_output_obj_ids(
+        self, inference_state, frame_idx, outputs, output_prob_thresh
+    ):
+        output_obj_ids = self._extract_long_video_output_obj_ids(outputs)
+        if not output_obj_ids:
+            return []
+
+        frame_scores = self._get_long_video_frame_scores(inference_state, frame_idx)
+        output_scores = self._get_long_video_output_scores(outputs, output_obj_ids)
+        if not frame_scores and not output_scores:
+            return output_obj_ids
+
+        valid_obj_ids = []
+        for obj_id in output_obj_ids:
+            if obj_id in frame_scores:
+                score = frame_scores[obj_id]
+            elif obj_id in output_scores:
+                score = output_scores[obj_id]
+            else:
+                continue
+            if self._long_video_score_passes_threshold(score, output_prob_thresh):
+                valid_obj_ids.append(obj_id)
+        return valid_obj_ids
+
+    def _get_long_video_frame_scores(self, inference_state, frame_idx):
+        tracker_metadata = inference_state.get("tracker_metadata")
+        if not isinstance(tracker_metadata, dict):
+            return {}
+        score_map = tracker_metadata.get("obj_id_to_sam2_score_frame_wise")
+        if not isinstance(score_map, dict):
+            return {}
+        frame_scores = score_map.get(frame_idx)
+        if not isinstance(frame_scores, dict):
+            return {}
+        return {
+            obj_id: score
+            for obj_id, score in (
+                (self._normalize_long_video_obj_id(obj_id), score)
+                for obj_id, score in frame_scores.items()
+            )
+            if obj_id is not None
+        }
+
+    def _get_long_video_output_scores(self, outputs, output_obj_ids):
+        if not isinstance(outputs, dict):
+            return {}
+        output_scores = outputs.get("out_sam2_probs")
+        if output_scores is None:
+            output_scores = outputs.get("out_probs")
+        output_scores = self._normalize_long_video_score_values(output_scores)
+        if not output_scores:
+            return {}
+        return dict(zip(output_obj_ids, output_scores))
+
+    def _long_video_score_passes_threshold(self, score, output_prob_thresh):
+        score = self._normalize_long_video_score(score)
+        return score is not None and score >= float(output_prob_thresh)
+
+    def _normalize_long_video_score_values(self, scores):
+        if scores is None:
+            return []
+        if isinstance(scores, torch.Tensor):
+            scores = scores.detach().cpu()
+        if hasattr(scores, "tolist"):
+            scores = scores.tolist()
+        if not isinstance(scores, (list, tuple)):
+            scores = [scores]
+        return scores
+
+    def _normalize_long_video_score(self, score):
+        if score is None:
+            return None
+        if isinstance(score, torch.Tensor):
+            if score.numel() == 0:
+                return None
+            score = score.detach().float().reshape(-1)[0].item()
+        elif hasattr(score, "item"):
+            score = score.item()
+        try:
+            return float(score)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_long_video_obj_ids(self, obj_ids):
+        if obj_ids is None:
+            return []
+        if isinstance(obj_ids, torch.Tensor):
+            obj_ids = obj_ids.detach().cpu()
+        if hasattr(obj_ids, "tolist"):
+            obj_ids = obj_ids.tolist()
+        if not isinstance(obj_ids, (list, tuple, set)):
+            obj_ids = [obj_ids]
+
+        normalized = []
+        for obj_id in obj_ids:
+            if isinstance(obj_id, (list, tuple)):
+                normalized.extend(self._normalize_long_video_obj_ids(obj_id))
+                continue
+            if hasattr(obj_id, "item"):
+                obj_id = obj_id.item()
+            try:
+                obj_id = int(obj_id)
+            except (TypeError, ValueError):
+                continue
+            normalized.append(obj_id)
+        return normalized
+
+    def _normalize_long_video_obj_id(self, obj_id):
+        obj_ids = self._normalize_long_video_obj_ids(obj_id)
+        if not obj_ids:
+            return None
+        return obj_ids[0]
+
+    def _long_video_lossless_lookback(self, long_video):
+        """Frame horizon within which past frame outputs must stay attendable.
+
+        ``history_frames`` is the GPU working window. Between ``history_frames``
+        and this lookback the heavy spatial-memory tensors are offloaded to CPU
+        (and reloaded via ``.cuda()`` on demand), so results are unchanged.
+        Only frames older than this lookback are hard-deleted.
+
+        With memory selection on, ``frame_filter`` can reach far back, so we
+        mirror the model's own horizon (it trims spatial memory at
+        ``20 * max_obj_ptrs_in_encoder``). With it off, the model never attends
+        beyond ``max(num_maskmem * stride, max_obj_ptrs_in_encoder)`` frames.
+        """
+        override = long_video.get("offload_lookback_frames")
+        if override is not None:
+            try:
+                override = int(override)
+            except (TypeError, ValueError):
+                override = None
+            if override is not None and override >= 1:
+                return override
+
+        max_obj_ptrs = int(getattr(self.model, "max_obj_ptrs_in_encoder", 16) or 16)
+        if bool(getattr(self.model, "use_memory_selection", False)):
+            return 20 * max_obj_ptrs
+        num_maskmem = int(getattr(self.model, "num_maskmem", 7) or 7)
+        stride = int(getattr(self.model, "memory_temporal_stride_for_eval", 1) or 1)
+        return max(num_maskmem * stride, max_obj_ptrs)
+
+    def _prune_long_video_state(self, inference_state, frame_idx, reverse):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return
+        history_frames = int(long_video.get("history_frames", 32))
+        cache_outputs = bool(long_video.get("cache_outputs", False))
+        lookback = max(self._long_video_lossless_lookback(long_video), history_frames)
+
+        def is_older_than(window, candidate_frame_idx, cond_frames):
+            if candidate_frame_idx in cond_frames:
+                return False
+            if reverse:
+                return candidate_frame_idx > frame_idx + window - 1
+            return candidate_frame_idx < frame_idx - window + 1
+
+        # Provably-dead state (never re-read by memory attention): drop once it
+        # leaves the GPU working window.
+        def should_prune(candidate_frame_idx, cond_frames):
+            return is_older_than(history_frames, candidate_frame_idx, cond_frames)
+
+        # Frame outputs that the model may still attend to: only hard-delete
+        # beyond the lossless lookback horizon.
+        def should_delete(candidate_frame_idx, cond_frames):
+            return is_older_than(lookback, candidate_frame_idx, cond_frames)
+
+        # In between: keep the entry but move heavy spatial-memory tensors to CPU.
+        def should_offload(candidate_frame_idx, cond_frames):
+            return is_older_than(
+                history_frames, candidate_frame_idx, cond_frames
+            ) and not is_older_than(lookback, candidate_frame_idx, cond_frames)
+
+        self._prune_long_video_state_dict(
+            inference_state,
+            cache_outputs=cache_outputs,
+            should_prune=should_prune,
+            should_delete=should_delete,
+            should_offload=should_offload,
+        )
+        for key in ("tracker_inference_states", "sam2_inference_states"):
+            for tracker_state in inference_state.get(key, []):
+                self._prune_long_video_state_dict(
+                    tracker_state,
+                    cache_outputs=cache_outputs,
+                    should_prune=should_prune,
+                    should_delete=should_delete,
+                    should_offload=should_offload,
+                )
+
+    def _to_cpu_recursive(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.cpu() if value.is_cuda else value
+        if isinstance(value, list):
+            return [self._to_cpu_recursive(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._to_cpu_recursive(v) for v in value)
+        return value
+
+    def _offload_long_video_frame_output(self, out):
+        # Only the spatial-memory tensors are offloaded: both read sites reload
+        # them with ``.cuda(non_blocking=True)`` (see sam3_tracker_base.py:656,
+        # video_tracking_multiplex.py:1405/1424), so this is lossless. obj_ptr /
+        # pred_masks are left untouched since they are consumed on-device.
+        if not isinstance(out, dict):
+            return
+        for key in ("maskmem_features", "maskmem_pos_enc"):
+            if key in out:
+                out[key] = self._to_cpu_recursive(out[key])
+
+    def _prune_frame_output_map(
+        self, frame_map, cond_frames, should_delete, should_offload
+    ):
+        if not isinstance(frame_map, dict):
+            return
+        for old_frame_idx in list(frame_map.keys()):
+            if should_delete(old_frame_idx, cond_frames):
+                frame_map.pop(old_frame_idx, None)
+            elif should_offload(old_frame_idx, cond_frames):
+                self._offload_long_video_frame_output(frame_map.get(old_frame_idx))
+
+    def _prune_long_video_state_dict(
+        self,
+        state,
+        cache_outputs,
+        should_prune,
+        should_delete,
+        should_offload,
+    ):
+        output_dict = state.get("output_dict")
+        cond_frames = set()
+        if isinstance(output_dict, dict):
+            cond_frames = set(output_dict.get("cond_frame_outputs", {}).keys())
+
+        consolidated = state.get("consolidated_frame_inds")
+        if isinstance(consolidated, dict):
+            cond_frames.update(consolidated.get("cond_frame_outputs", set()))
+
+        # Frame outputs: delete beyond lookback, offload spatial memory in between.
+        if isinstance(output_dict, dict):
+            self._prune_frame_output_map(
+                output_dict.get("non_cond_frame_outputs"),
+                cond_frames,
+                should_delete,
+                should_offload,
+            )
+        for per_obj_key in ("output_dict_per_obj", "temp_output_dict_per_obj"):
+            for obj_output_dict in state.get(per_obj_key, {}).values():
+                self._prune_frame_output_map(
+                    obj_output_dict.get("non_cond_frame_outputs"),
+                    cond_frames,
+                    should_delete,
+                    should_offload,
+                )
+
+        frames_already_tracked = state.get("frames_already_tracked")
+        if isinstance(frames_already_tracked, dict):
+            for old_frame_idx in list(frames_already_tracked.keys()):
+                if should_delete(old_frame_idx, cond_frames):
+                    frames_already_tracked.pop(old_frame_idx, None)
+
+        cached_frame_outputs = state.get("cached_frame_outputs")
+        if isinstance(cached_frame_outputs, dict) and not cache_outputs:
+            for old_frame_idx in list(cached_frame_outputs.keys()):
+                if should_prune(old_frame_idx, cond_frames):
+                    cached_frame_outputs.pop(old_frame_idx, None)
+
+        feature_cache = state.get("feature_cache")
+        if isinstance(feature_cache, dict):
+            for old_frame_idx in list(feature_cache.keys()):
+                if isinstance(old_frame_idx, int) and should_prune(
+                    old_frame_idx, cond_frames
+                ):
+                    feature_cache.pop(old_frame_idx, None)
+
+        tracker_metadata = state.get("tracker_metadata")
+        if isinstance(tracker_metadata, dict):
+            self._prune_long_video_tracker_metadata(
+                tracker_metadata, cond_frames, should_prune
+            )
+
+    def _prune_long_video_tracker_metadata(
+        self,
+        tracker_metadata,
+        cond_frames,
+        should_prune,
+    ):
+        # These frame-indexed score maps store GPU tensors in SAM3.1 multiplex.
+        # Leaving them unbounded defeats the sliding-state memory limit.
+        for score_key in (
+            "obj_id_to_sam2_score_frame_wise",
+            "obj_id_to_tracker_score_frame_wise",
+        ):
+            score_map = tracker_metadata.get(score_key)
+            if isinstance(score_map, dict):
+                for old_frame_idx in list(score_map.keys()):
+                    if should_prune(old_frame_idx, cond_frames):
+                        score_map.pop(old_frame_idx, None)
+
+        rank0_metadata = tracker_metadata.get("rank0_metadata")
+        if not isinstance(rank0_metadata, dict):
+            return
+
+        suppressed_obj_ids = rank0_metadata.get("suppressed_obj_ids")
+        if isinstance(suppressed_obj_ids, dict):
+            for old_frame_idx in list(suppressed_obj_ids.keys()):
+                if should_prune(old_frame_idx, cond_frames):
+                    suppressed_obj_ids.pop(old_frame_idx, None)
+
+        for list_key in ("unmatched_frame_inds", "overlap_pair_to_frame_inds"):
+            frame_lists = rank0_metadata.get(list_key)
+            if not isinstance(frame_lists, dict):
+                continue
+            for key, frame_indices in list(frame_lists.items()):
+                if not isinstance(frame_indices, list):
+                    continue
+                frame_lists[key] = [
+                    idx for idx in frame_indices if not should_prune(idx, cond_frames)
+                ]
 
     def reset_session(self, session_id):
         """Reset the session to its initial state."""
