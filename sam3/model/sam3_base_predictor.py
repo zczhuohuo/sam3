@@ -452,6 +452,51 @@ class Sam3BasePredictor:
                 ):
                     feature_cache.pop(old_frame_idx, None)
 
+        tracker_metadata = state.get("tracker_metadata")
+        if isinstance(tracker_metadata, dict):
+            self._prune_long_video_tracker_metadata(
+                tracker_metadata, cond_frames, should_prune
+            )
+
+    def _prune_long_video_tracker_metadata(
+        self,
+        tracker_metadata,
+        cond_frames,
+        should_prune,
+    ):
+        # These frame-indexed score maps store GPU tensors in SAM3.1 multiplex.
+        # Leaving them unbounded defeats the sliding-state memory limit.
+        for score_key in (
+            "obj_id_to_sam2_score_frame_wise",
+            "obj_id_to_tracker_score_frame_wise",
+        ):
+            score_map = tracker_metadata.get(score_key)
+            if isinstance(score_map, dict):
+                for old_frame_idx in list(score_map.keys()):
+                    if should_prune(old_frame_idx, cond_frames):
+                        score_map.pop(old_frame_idx, None)
+
+        rank0_metadata = tracker_metadata.get("rank0_metadata")
+        if not isinstance(rank0_metadata, dict):
+            return
+
+        suppressed_obj_ids = rank0_metadata.get("suppressed_obj_ids")
+        if isinstance(suppressed_obj_ids, dict):
+            for old_frame_idx in list(suppressed_obj_ids.keys()):
+                if should_prune(old_frame_idx, cond_frames):
+                    suppressed_obj_ids.pop(old_frame_idx, None)
+
+        for list_key in ("unmatched_frame_inds", "overlap_pair_to_frame_inds"):
+            frame_lists = rank0_metadata.get(list_key)
+            if not isinstance(frame_lists, dict):
+                continue
+            for key, frame_indices in list(frame_lists.items()):
+                if not isinstance(frame_indices, list):
+                    continue
+                frame_lists[key] = [
+                    idx for idx in frame_indices if not should_prune(idx, cond_frames)
+                ]
+
     def reset_session(self, session_id):
         """Reset the session to its initial state."""
         session = self._get_session(session_id)

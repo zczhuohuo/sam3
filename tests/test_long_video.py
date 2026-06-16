@@ -44,6 +44,19 @@ def _state_with_frames(frame_count=6):
             **{idx: (torch.tensor([idx]), {}) for idx in range(6)},
             "text": "keep",
         },
+        "tracker_metadata": {
+            "obj_id_to_sam2_score_frame_wise": {
+                idx: {1: torch.tensor(float(idx))} for idx in range(6)
+            },
+            "obj_id_to_tracker_score_frame_wise": {
+                idx: {1: torch.tensor(float(idx))} for idx in range(6)
+            },
+            "rank0_metadata": {
+                "suppressed_obj_ids": {idx: set() for idx in range(6)},
+                "unmatched_frame_inds": {1: list(range(6))},
+                "overlap_pair_to_frame_inds": {(1, 2): list(range(6))},
+            },
+        },
     }
 
 
@@ -64,6 +77,16 @@ def test_long_video_pruning_keeps_cond_and_recent_non_cond_frames():
     assert set(state["cached_frame_outputs"]) == {0, 4, 5}
     assert set(k for k in state["feature_cache"] if isinstance(k, int)) == {0, 4, 5}
     assert state["feature_cache"]["text"] == "keep"
+    metadata = state["tracker_metadata"]
+    assert set(metadata["obj_id_to_sam2_score_frame_wise"]) == {0, 4, 5}
+    assert set(metadata["obj_id_to_tracker_score_frame_wise"]) == {0, 4, 5}
+    assert set(metadata["rank0_metadata"]["suppressed_obj_ids"]) == {0, 4, 5}
+    assert metadata["rank0_metadata"]["unmatched_frame_inds"][1] == [0, 4, 5]
+    assert metadata["rank0_metadata"]["overlap_pair_to_frame_inds"][(1, 2)] == [
+        0,
+        4,
+        5,
+    ]
 
 
 class FakeModel:
