@@ -380,7 +380,11 @@ class Sam3BasePredictor:
                     reverse=False,
                 ):
                     self._maintain_long_video_active_objects(
-                        inference_state, frame_idx, outputs, False
+                        inference_state,
+                        frame_idx,
+                        outputs,
+                        False,
+                        output_prob_thresh,
                     )
                     self._prune_long_video_state(inference_state, frame_idx, False)
                     yield {"frame_index": frame_idx, "outputs": outputs}
@@ -391,7 +395,11 @@ class Sam3BasePredictor:
                     reverse=True,
                 ):
                     self._maintain_long_video_active_objects(
-                        inference_state, frame_idx, outputs, True
+                        inference_state,
+                        frame_idx,
+                        outputs,
+                        True,
+                        output_prob_thresh,
                     )
                     self._prune_long_video_state(inference_state, frame_idx, True)
                     yield {"frame_index": frame_idx, "outputs": outputs}
@@ -430,7 +438,7 @@ class Sam3BasePredictor:
         return restore
 
     def _maintain_long_video_active_objects(
-        self, inference_state, frame_idx, outputs, reverse
+        self, inference_state, frame_idx, outputs, reverse, output_prob_thresh
     ):
         long_video = inference_state.get("long_video") or {}
         if not long_video.get("enabled", False):
@@ -457,7 +465,10 @@ class Sam3BasePredictor:
             if obj_id not in removed:
                 first_seen.setdefault(obj_id, frame_idx)
 
-        for obj_id in self._extract_long_video_output_obj_ids(outputs):
+        valid_output_obj_ids = self._extract_long_video_valid_output_obj_ids(
+            inference_state, frame_idx, outputs, output_prob_thresh
+        )
+        for obj_id in valid_output_obj_ids:
             if obj_id not in removed:
                 first_seen.setdefault(obj_id, frame_idx)
                 last_output[obj_id] = frame_idx
@@ -495,6 +506,89 @@ class Sam3BasePredictor:
             return []
         return self._normalize_long_video_obj_ids(outputs.get("out_obj_ids"))
 
+    def _extract_long_video_valid_output_obj_ids(
+        self, inference_state, frame_idx, outputs, output_prob_thresh
+    ):
+        output_obj_ids = self._extract_long_video_output_obj_ids(outputs)
+        if not output_obj_ids:
+            return []
+
+        frame_scores = self._get_long_video_frame_scores(inference_state, frame_idx)
+        output_scores = self._get_long_video_output_scores(outputs, output_obj_ids)
+        if not frame_scores and not output_scores:
+            return output_obj_ids
+
+        valid_obj_ids = []
+        for obj_id in output_obj_ids:
+            if obj_id in frame_scores:
+                score = frame_scores[obj_id]
+            elif obj_id in output_scores:
+                score = output_scores[obj_id]
+            else:
+                continue
+            if self._long_video_score_passes_threshold(score, output_prob_thresh):
+                valid_obj_ids.append(obj_id)
+        return valid_obj_ids
+
+    def _get_long_video_frame_scores(self, inference_state, frame_idx):
+        tracker_metadata = inference_state.get("tracker_metadata")
+        if not isinstance(tracker_metadata, dict):
+            return {}
+        score_map = tracker_metadata.get("obj_id_to_sam2_score_frame_wise")
+        if not isinstance(score_map, dict):
+            return {}
+        frame_scores = score_map.get(frame_idx)
+        if not isinstance(frame_scores, dict):
+            return {}
+        return {
+            obj_id: score
+            for obj_id, score in (
+                (self._normalize_long_video_obj_id(obj_id), score)
+                for obj_id, score in frame_scores.items()
+            )
+            if obj_id is not None
+        }
+
+    def _get_long_video_output_scores(self, outputs, output_obj_ids):
+        if not isinstance(outputs, dict):
+            return {}
+        output_scores = outputs.get("out_sam2_probs")
+        if output_scores is None:
+            output_scores = outputs.get("out_probs")
+        output_scores = self._normalize_long_video_score_values(output_scores)
+        if not output_scores:
+            return {}
+        return dict(zip(output_obj_ids, output_scores))
+
+    def _long_video_score_passes_threshold(self, score, output_prob_thresh):
+        score = self._normalize_long_video_score(score)
+        return score is not None and score >= float(output_prob_thresh)
+
+    def _normalize_long_video_score_values(self, scores):
+        if scores is None:
+            return []
+        if isinstance(scores, torch.Tensor):
+            scores = scores.detach().cpu()
+        if hasattr(scores, "tolist"):
+            scores = scores.tolist()
+        if not isinstance(scores, (list, tuple)):
+            scores = [scores]
+        return scores
+
+    def _normalize_long_video_score(self, score):
+        if score is None:
+            return None
+        if isinstance(score, torch.Tensor):
+            if score.numel() == 0:
+                return None
+            score = score.detach().float().reshape(-1)[0].item()
+        elif hasattr(score, "item"):
+            score = score.item()
+        try:
+            return float(score)
+        except (TypeError, ValueError):
+            return None
+
     def _normalize_long_video_obj_ids(self, obj_ids):
         if obj_ids is None:
             return []
@@ -518,6 +612,12 @@ class Sam3BasePredictor:
                 continue
             normalized.append(obj_id)
         return normalized
+
+    def _normalize_long_video_obj_id(self, obj_id):
+        obj_ids = self._normalize_long_video_obj_ids(obj_id)
+        if not obj_ids:
+            return None
+        return obj_ids[0]
 
     def _prune_long_video_state(self, inference_state, frame_idx, reverse):
         long_video = inference_state.get("long_video") or {}

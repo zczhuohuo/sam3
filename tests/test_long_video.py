@@ -1,5 +1,5 @@
-import pytest
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -248,6 +248,7 @@ class ActiveObjectWindowFakeModel:
             },
             "tracker_metadata": {
                 "obj_ids_all_gpu": np.array([], dtype=np.int64),
+                "obj_id_to_sam2_score_frame_wise": {},
             },
             "output_dict": {
                 "cond_frame_outputs": {},
@@ -262,12 +263,27 @@ class ActiveObjectWindowFakeModel:
         max_frame_num_to_track=None,
         reverse=False,
     ):
-        for frame_idx, out_obj_ids, tracked_obj_ids in self.frames:
+        for frame in self.frames:
+            if len(frame) == 3:
+                frame_idx, out_obj_ids, tracked_obj_ids = frame
+                sam2_scores = {}
+            else:
+                frame_idx, out_obj_ids, tracked_obj_ids, sam2_scores = frame
             inference_state["tracker_metadata"]["obj_ids_all_gpu"] = np.array(
                 tracked_obj_ids, dtype=np.int64
             )
+            inference_state["tracker_metadata"]["obj_id_to_sam2_score_frame_wise"][
+                frame_idx
+            ] = {
+                obj_id: torch.tensor(score, dtype=torch.float32)
+                for obj_id, score in sam2_scores.items()
+            }
             yield frame_idx, {
                 "out_obj_ids": np.array(out_obj_ids, dtype=np.int64),
+                "out_probs": np.array(
+                    [sam2_scores.get(obj_id, 1.0) for obj_id in out_obj_ids],
+                    dtype=np.float32,
+                ),
                 "out_binary_masks": np.zeros((len(out_obj_ids), 1, 1), dtype=bool),
             }
 
@@ -290,8 +306,8 @@ def test_long_video_active_window_removes_disappeared_objects():
     predictor = Sam3BasePredictor()
     predictor.model = ActiveObjectWindowFakeModel(
         [
-            (0, [1], [1]),
-            (1, [1], [1]),
+            (0, [1], [1], {1: 0.9}),
+            (1, [1], [1], {1: 0.9}),
             (2, [], [1]),
             (3, [], [1]),
         ]
@@ -317,10 +333,10 @@ def test_long_video_active_window_keeps_recently_output_objects():
     predictor = Sam3BasePredictor()
     predictor.model = ActiveObjectWindowFakeModel(
         [
-            (0, [2], [2]),
-            (1, [2], [2]),
-            (2, [2], [2]),
-            (3, [2], [2]),
+            (0, [2], [2], {2: 0.9}),
+            (1, [2], [2], {2: 0.9}),
+            (2, [2], [2], {2: 0.9}),
+            (3, [2], [2], {2: 0.9}),
         ]
     )
     predictor.start_session(
@@ -333,6 +349,36 @@ def test_long_video_active_window_keeps_recently_output_objects():
     list(predictor.propagate_in_video("s", propagation_direction="forward"))
 
     assert predictor.model.removed_objects == []
+
+
+def test_long_video_active_window_ignores_low_score_ghost_masks():
+    predictor = Sam3BasePredictor()
+    predictor.model = ActiveObjectWindowFakeModel(
+        [
+            (0, [5], [5], {5: 0.9}),
+            (1, [5], [5], {5: 0.2}),
+            (2, [5], [5], {5: 0.2}),
+        ]
+    )
+    predictor.start_session(
+        "video.mp4",
+        session_id="s",
+        long_video_mode=True,
+        long_video_history_frames=2,
+    )
+
+    outputs = list(
+        predictor.propagate_in_video(
+            "s", propagation_direction="forward", output_prob_thresh=0.5
+        )
+    )
+
+    assert [out["outputs"]["out_obj_ids"].tolist() for out in outputs] == [
+        [5],
+        [5],
+        [5],
+    ]
+    assert predictor.model.removed_objects == [(5, None, False)]
 
 
 def test_long_video_active_window_graces_objects_without_outputs():
