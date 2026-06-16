@@ -19,14 +19,19 @@ def _frame_out(frame_idx):
     }
 
 
-def _state_with_frames(frame_count=6):
+def _state_with_frames(frame_count=6, offload_lookback_frames=2):
     non_cond = {idx: _frame_out(idx) for idx in range(1, frame_count)}
+    long_video = {
+        "enabled": True,
+        "history_frames": 2,
+        "cache_outputs": False,
+    }
+    # Collapse the offload tier onto the history window so these bookkeeping
+    # tests exercise the deletion path directly (see _long_video_lossless_lookback).
+    if offload_lookback_frames is not None:
+        long_video["offload_lookback_frames"] = offload_lookback_frames
     return {
-        "long_video": {
-            "enabled": True,
-            "history_frames": 2,
-            "cache_outputs": False,
-        },
+        "long_video": long_video,
         "output_dict": {
             "cond_frame_outputs": {0: _frame_out(0)},
             "non_cond_frame_outputs": dict(non_cond),
@@ -43,23 +48,27 @@ def _state_with_frames(frame_count=6):
                 "non_cond_frame_outputs": dict(non_cond),
             }
         },
-        "frames_already_tracked": {idx: {"reverse": False} for idx in range(6)},
-        "cached_frame_outputs": {idx: {1: torch.tensor([idx])} for idx in range(6)},
+        "frames_already_tracked": {
+            idx: {"reverse": False} for idx in range(frame_count)
+        },
+        "cached_frame_outputs": {
+            idx: {1: torch.tensor([idx])} for idx in range(frame_count)
+        },
         "feature_cache": {
-            **{idx: (torch.tensor([idx]), {}) for idx in range(6)},
+            **{idx: (torch.tensor([idx]), {}) for idx in range(frame_count)},
             "text": "keep",
         },
         "tracker_metadata": {
             "obj_id_to_sam2_score_frame_wise": {
-                idx: {1: torch.tensor(float(idx))} for idx in range(6)
+                idx: {1: torch.tensor(float(idx))} for idx in range(frame_count)
             },
             "obj_id_to_tracker_score_frame_wise": {
-                idx: {1: torch.tensor(float(idx))} for idx in range(6)
+                idx: {1: torch.tensor(float(idx))} for idx in range(frame_count)
             },
             "rank0_metadata": {
-                "suppressed_obj_ids": {idx: set() for idx in range(6)},
-                "unmatched_frame_inds": {1: list(range(6))},
-                "overlap_pair_to_frame_inds": {(1, 2): list(range(6))},
+                "suppressed_obj_ids": {idx: set() for idx in range(frame_count)},
+                "unmatched_frame_inds": {1: list(range(frame_count))},
+                "overlap_pair_to_frame_inds": {(1, 2): list(range(frame_count))},
             },
         },
     }
@@ -212,6 +221,7 @@ def test_streaming_long_video_state_stays_bounded():
         session_id="s",
         long_video_mode=True,
         long_video_history_frames=2,
+        long_video_offload_lookback_frames=2,
         long_video_postprocess_batch_size=1,
         long_video_grounding_batch_size=4,
     )
@@ -769,3 +779,202 @@ def test_multiplex_inner_tracker_receives_offload_state_to_cpu():
 
     assert result == {"ok": True}
     assert captured["offload_state_to_cpu"] is True
+
+
+# ── A1 / B4: two-tier pruning (offload mid-range, delete beyond lookback) ──
+
+
+def test_long_video_offload_horizon_keeps_midrange_frames():
+    predictor = Sam3BasePredictor()
+    state = _state_with_frames(frame_count=12, offload_lookback_frames=5)
+
+    predictor._prune_long_video_state(state, frame_idx=11, reverse=False)
+
+    # Frame outputs: only hard-deleted beyond lookback (frame < 11 - 5 + 1 = 7);
+    # frames in (history, lookback] are kept (offloaded), cond frame 0 preserved.
+    assert set(state["output_dict"]["non_cond_frame_outputs"]) == {7, 8, 9, 10, 11}
+    assert set(state["output_dict_per_obj"][0]["non_cond_frame_outputs"]) == {
+        7,
+        8,
+        9,
+        10,
+        11,
+    }
+    # frames_already_tracked aligns with frame-output deletion (lookback horizon).
+    assert set(state["frames_already_tracked"]) == {0, 7, 8, 9, 10, 11}
+    # Provably-dead structures are dropped at the (smaller) history window.
+    assert set(state["cached_frame_outputs"]) == {0, 10, 11}
+    assert set(k for k in state["feature_cache"] if isinstance(k, int)) == {0, 10, 11}
+    metadata = state["tracker_metadata"]
+    assert set(metadata["obj_id_to_sam2_score_frame_wise"]) == {0, 10, 11}
+
+
+def test_long_video_offload_tier_selection():
+    # frame_idx=8, history=2, lookback=4 partitions past frames into three tiers:
+    #   frame 2  -> older than lookback        -> hard-deleted
+    #   frame 6  -> between history & lookback  -> kept, spatial memory offloaded
+    #   frame 7  -> within history window        -> kept untouched
+    offloaded = []
+
+    class _RecordingPredictor(Sam3BasePredictor):
+        def _offload_long_video_frame_output(self, out):
+            offloaded.append(out["_frame"])
+            super()._offload_long_video_frame_output(out)
+
+    predictor = _RecordingPredictor()
+    state = {
+        "long_video": {
+            "enabled": True,
+            "history_frames": 2,
+            "offload_lookback_frames": 4,
+        },
+        "output_dict": {
+            "cond_frame_outputs": {0: {"_frame": 0}},
+            "non_cond_frame_outputs": {
+                2: {"_frame": 2},
+                6: {"_frame": 6},
+                7: {"_frame": 7},
+            },
+        },
+    }
+
+    predictor._prune_long_video_state(state, frame_idx=8, reverse=False)
+
+    assert set(state["output_dict"]["non_cond_frame_outputs"]) == {6, 7}
+    assert offloaded == [6]
+
+
+def test_long_video_offload_only_targets_spatial_memory_tensors():
+    # The offload helper moves only maskmem_* tensors (both reloaded via .cuda()
+    # on read); obj_ptr / pred_masks are consumed on-device and left in place.
+    # Tensors are already on CPU here, so this is a structural / no-error check.
+    predictor = Sam3BasePredictor()
+    maskmem = torch.zeros(2, 2)
+    pos = torch.zeros(2, 2)
+    obj_ptr = torch.zeros(2, 2)
+    out = {
+        "maskmem_features": maskmem,
+        "maskmem_pos_enc": [pos],
+        "obj_ptr": obj_ptr,
+    }
+    predictor._offload_long_video_frame_output(out)
+    assert out["maskmem_features"].equal(maskmem)
+    assert out["maskmem_pos_enc"][0].equal(pos)
+    assert out["obj_ptr"] is obj_ptr
+
+
+# ── A1 / C7: lookback horizon derives from the model's real attention reach ──
+
+
+def test_lossless_lookback_uses_model_horizon():
+    predictor = Sam3BasePredictor()
+
+    class _Model:
+        use_memory_selection = True
+        max_obj_ptrs_in_encoder = 16
+        num_maskmem = 7
+        memory_temporal_stride_for_eval = 1
+
+    predictor.model = _Model()
+    # With memory selection on, mirror the model's far-old trim horizon.
+    assert predictor._long_video_lossless_lookback({}) == 320
+    predictor.model.use_memory_selection = False
+    assert predictor._long_video_lossless_lookback({}) == 16
+    # Explicit override wins.
+    assert predictor._long_video_lossless_lookback(
+        {"offload_lookback_frames": 50}
+    ) == 50
+
+
+class _SelectionFakeModel:
+    def __init__(self):
+        self.use_memory_selection = True
+        self.num_maskmem = 7
+        self.max_obj_ptrs_in_encoder = 16
+        self.postprocess_batch_size = 16
+        self.batched_grounding_batch_size = 16
+        self.seen = []
+
+    def init_state(self, resource_path, **kwargs):
+        return {
+            "long_video": {"enabled": True, "history_frames": 2},
+            "output_dict": {
+                "cond_frame_outputs": {},
+                "non_cond_frame_outputs": {},
+            },
+        }
+
+    def propagate_in_video(
+        self,
+        inference_state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        self.seen.append(
+            (
+                self.use_memory_selection,
+                self.num_maskmem,
+                self.max_obj_ptrs_in_encoder,
+            )
+        )
+        yield 0, {"ok": True}
+
+
+def test_disable_temporal_disambiguation_and_shrink_overrides():
+    predictor = Sam3BasePredictor()
+    predictor.model = _SelectionFakeModel()
+    predictor.start_session(
+        "v.mp4",
+        session_id="s",
+        long_video_mode=True,
+        long_video_history_frames=2,
+        long_video_disable_temporal_disambiguation=True,
+        long_video_num_maskmem=4,
+        long_video_max_obj_ptrs=8,
+    )
+
+    list(predictor.propagate_in_video("s", propagation_direction="forward"))
+
+    # Overrides applied during propagation...
+    assert predictor.model.seen == [(False, 4, 8)]
+    # ...and restored afterwards.
+    assert predictor.model.use_memory_selection is True
+    assert predictor.model.num_maskmem == 7
+    assert predictor.model.max_obj_ptrs_in_encoder == 16
+
+
+# ── A3: bounded sliding-window prefetch loader ──
+
+
+def test_lazy_image_loader_prefetch_returns_correct_frames(tmp_path):
+    paths = []
+    for idx in range(10):
+        arr = np.full((4, 4, 3), idx * 20, dtype=np.uint8)
+        path = tmp_path / f"{idx}.png"
+        Image.fromarray(arr).save(path)
+        paths.append(str(path))
+
+    mean = torch.zeros(3, 1, 1, dtype=torch.float16)
+    std = torch.ones(3, 1, 1, dtype=torch.float16)
+    loader = LazyImageFrameLoader(
+        paths,
+        image_size=4,
+        offload_video_to_cpu=True,
+        img_mean=mean,
+        img_std=std,
+        prefetch_window=3,
+        keep_behind=1,
+    )
+    try:
+        assert len(loader) == 10
+        assert loader[0].shape == (3, 4, 4)
+        # list / slice indexing returns a stacked tensor
+        assert loader[[1, 2, 3]].shape == (3, 3, 4, 4)
+        assert loader[2:5].shape == (3, 3, 4, 4)
+        # sequential access keeps the cache bounded by capacity
+        for idx in range(10):
+            _ = loader[idx]
+        assert len(loader.cache) <= loader.capacity
+    finally:
+        loader.close()

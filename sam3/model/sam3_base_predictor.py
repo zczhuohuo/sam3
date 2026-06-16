@@ -77,6 +77,15 @@ class Sam3BasePredictor:
                 long_video_grounding_batch_size=request.get(
                     "long_video_grounding_batch_size", None
                 ),
+                long_video_offload_lookback_frames=request.get(
+                    "long_video_offload_lookback_frames", None
+                ),
+                long_video_disable_temporal_disambiguation=request.get(
+                    "long_video_disable_temporal_disambiguation", False
+                ),
+                long_video_num_maskmem=request.get("long_video_num_maskmem", None),
+                long_video_max_obj_ptrs=request.get("long_video_max_obj_ptrs", None),
+                long_video_compile=request.get("long_video_compile", False),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -149,6 +158,11 @@ class Sam3BasePredictor:
         long_video_cache_outputs=False,
         long_video_postprocess_batch_size=None,
         long_video_grounding_batch_size=None,
+        long_video_offload_lookback_frames=None,
+        long_video_disable_temporal_disambiguation=False,
+        long_video_num_maskmem=None,
+        long_video_max_obj_ptrs=None,
+        long_video_compile=False,
     ):
         """Start a new inference session on a video directory or path."""
         if offload_video_to_cpu is None:
@@ -160,6 +174,14 @@ class Sam3BasePredictor:
                 raise ValueError(
                     "long_video_loader_type must be one of 'auto', 'torchcodec', "
                     f"or 'image_folder'; got {long_video_loader_type!r}"
+                )
+            if (
+                long_video_offload_lookback_frames is not None
+                and int(long_video_offload_lookback_frames) < long_video_history_frames
+            ):
+                raise ValueError(
+                    "long_video_offload_lookback_frames must be >= "
+                    "long_video_history_frames"
                 )
 
         init_kwargs = dict(
@@ -207,6 +229,9 @@ class Sam3BasePredictor:
             init_kwargs = {
                 k: v for k, v in init_kwargs.items() if k in sig.parameters
             }
+        if long_video_mode and long_video_compile:
+            self._maybe_compile_model()
+
         inference_state = self.model.init_state(**init_kwargs)
         inference_state.setdefault(
             "long_video",
@@ -219,6 +244,19 @@ class Sam3BasePredictor:
                 "grounding_batch_size": long_video_grounding_batch_size,
             },
         )
+        if long_video_mode:
+            # Predictor-controlled runtime knobs (consumed in propagate_in_video).
+            long_video_state = inference_state["long_video"]
+            long_video_state["offload_lookback_frames"] = (
+                int(long_video_offload_lookback_frames)
+                if long_video_offload_lookback_frames is not None
+                else None
+            )
+            long_video_state["disable_temporal_disambiguation"] = bool(
+                long_video_disable_temporal_disambiguation
+            )
+            long_video_state["num_maskmem"] = long_video_num_maskmem
+            long_video_state["max_obj_ptrs"] = long_video_max_obj_ptrs
 
         if not session_id:
             session_id = str(uuid.uuid4())
@@ -408,28 +446,82 @@ class Sam3BasePredictor:
                 restore_runtime_overrides()
             logger.info(f"propagation ended in session {session_id}")
 
+    def _maybe_compile_model(self):
+        """Opt-in torch.compile for long-video sessions (C6).
+
+        Compiles the shared model once; later sessions reuse the compiled graphs.
+        Best-effort: a compilation failure logs and falls back to eager mode.
+        """
+        if getattr(self.model, "_model_is_compiled", False):
+            return
+        if not hasattr(self.model, "_compile_model"):
+            logger.warning(
+                "long_video_compile requested but model has no _compile_model()"
+            )
+            return
+        try:
+            self.model.compile_model = True
+            if hasattr(self.model, "detector"):
+                self.model.detector.compile_model = True
+            self.model._compile_model()
+            logger.info("long_video_compile: torch.compile enabled on shared model")
+        except Exception as exc:  # compilation is best-effort
+            logger.warning(
+                f"long_video_compile failed; continuing without compile: {exc}"
+            )
+
     def _apply_long_video_runtime_overrides(self, inference_state):
         long_video = inference_state.get("long_video") or {}
         if not long_video.get("enabled", False):
             return lambda: None
 
-        overrides = {
-            "postprocess_batch_size": long_video.get("postprocess_batch_size"),
-            "batched_grounding_batch_size": long_video.get("grounding_batch_size"),
-        }
         original_values = {}
-        for attr_name, override_value in overrides.items():
-            if override_value is None:
-                continue
-            override_value = int(override_value)
-            if override_value < 1 or not hasattr(self.model, attr_name):
-                continue
-            original_values[attr_name] = getattr(self.model, attr_name)
-            setattr(
-                self.model,
-                attr_name,
-                min(original_values[attr_name], override_value),
-            )
+
+        def override_attr(attr_name, value, *, mode):
+            # mode="min": only shrink an existing numeric knob (memory/throughput
+            # tradeoff). mode="set": replace outright (e.g. boolean toggles).
+            if value is None or not hasattr(self.model, attr_name):
+                return
+            if attr_name in original_values:
+                return
+            current = getattr(self.model, attr_name)
+            if mode == "min":
+                value = int(value)
+                if value < 1:
+                    return
+                new_value = min(current, value) if current is not None else value
+            else:
+                new_value = value
+            if new_value == current:
+                return
+            original_values[attr_name] = current
+            setattr(self.model, attr_name, new_value)
+
+        # C8 — batch sizes: trade throughput for peak memory (only lower on OOM).
+        override_attr(
+            "postprocess_batch_size",
+            long_video.get("postprocess_batch_size"),
+            mode="min",
+        )
+        override_attr(
+            "batched_grounding_batch_size",
+            long_video.get("grounding_batch_size"),
+            mode="min",
+        )
+
+        # C7 — shrink the real memory-attention lookback. Disabling temporal
+        # disambiguation bounds frame_filter to ~max_obj_ptrs_in_encoder frames,
+        # which (with a matching history_frames) makes pruning lossless and also
+        # cuts compute. Shrinking num_maskmem / max_obj_ptrs reduces both memory
+        # and per-frame attention cost at a small accuracy cost.
+        if long_video.get("disable_temporal_disambiguation", False):
+            override_attr("use_memory_selection", False, mode="set")
+        override_attr(
+            "num_maskmem", long_video.get("num_maskmem"), mode="min"
+        )
+        override_attr(
+            "max_obj_ptrs_in_encoder", long_video.get("max_obj_ptrs"), mode="min"
+        )
 
         def restore():
             for attr_name, original_value in original_values.items():
@@ -621,24 +713,72 @@ class Sam3BasePredictor:
             return None
         return obj_ids[0]
 
+    def _long_video_lossless_lookback(self, long_video):
+        """Frame horizon within which past frame outputs must stay attendable.
+
+        ``history_frames`` is the GPU working window. Between ``history_frames``
+        and this lookback the heavy spatial-memory tensors are offloaded to CPU
+        (and reloaded via ``.cuda()`` on demand), so results are unchanged.
+        Only frames older than this lookback are hard-deleted.
+
+        With memory selection on, ``frame_filter`` can reach far back, so we
+        mirror the model's own horizon (it trims spatial memory at
+        ``20 * max_obj_ptrs_in_encoder``). With it off, the model never attends
+        beyond ``max(num_maskmem * stride, max_obj_ptrs_in_encoder)`` frames.
+        """
+        override = long_video.get("offload_lookback_frames")
+        if override is not None:
+            try:
+                override = int(override)
+            except (TypeError, ValueError):
+                override = None
+            if override is not None and override >= 1:
+                return override
+
+        max_obj_ptrs = int(getattr(self.model, "max_obj_ptrs_in_encoder", 16) or 16)
+        if bool(getattr(self.model, "use_memory_selection", False)):
+            return 20 * max_obj_ptrs
+        num_maskmem = int(getattr(self.model, "num_maskmem", 7) or 7)
+        stride = int(getattr(self.model, "memory_temporal_stride_for_eval", 1) or 1)
+        return max(num_maskmem * stride, max_obj_ptrs)
+
     def _prune_long_video_state(self, inference_state, frame_idx, reverse):
         long_video = inference_state.get("long_video") or {}
         if not long_video.get("enabled", False):
             return
         history_frames = int(long_video.get("history_frames", 32))
         cache_outputs = bool(long_video.get("cache_outputs", False))
+        lookback = max(self._long_video_lossless_lookback(long_video), history_frames)
 
-        def should_prune(candidate_frame_idx, cond_frames):
+        def is_older_than(window, candidate_frame_idx, cond_frames):
             if candidate_frame_idx in cond_frames:
                 return False
             if reverse:
-                return candidate_frame_idx > frame_idx + history_frames - 1
-            return candidate_frame_idx < frame_idx - history_frames + 1
+                return candidate_frame_idx > frame_idx + window - 1
+            return candidate_frame_idx < frame_idx - window + 1
+
+        # Provably-dead state (never re-read by memory attention): drop once it
+        # leaves the GPU working window.
+        def should_prune(candidate_frame_idx, cond_frames):
+            return is_older_than(history_frames, candidate_frame_idx, cond_frames)
+
+        # Frame outputs that the model may still attend to: only hard-delete
+        # beyond the lossless lookback horizon.
+        def should_delete(candidate_frame_idx, cond_frames):
+            return is_older_than(lookback, candidate_frame_idx, cond_frames)
+
+        # In between: keep the entry but move heavy spatial-memory tensors to CPU.
+        def should_offload(candidate_frame_idx, cond_frames):
+            return is_older_than(
+                history_frames, candidate_frame_idx, cond_frames
+            ) and not is_older_than(lookback, candidate_frame_idx, cond_frames)
 
         self._prune_long_video_state_dict(
             inference_state,
             cache_outputs=cache_outputs,
             should_prune=should_prune,
+            should_delete=should_delete,
+            should_offload=should_offload,
         )
         for key in ("tracker_inference_states", "sam2_inference_states"):
             for tracker_state in inference_state.get(key, []):
@@ -646,44 +786,79 @@ class Sam3BasePredictor:
                     tracker_state,
                     cache_outputs=cache_outputs,
                     should_prune=should_prune,
+                    should_delete=should_delete,
+                    should_offload=should_offload,
                 )
+
+    def _to_cpu_recursive(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.cpu() if value.is_cuda else value
+        if isinstance(value, list):
+            return [self._to_cpu_recursive(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._to_cpu_recursive(v) for v in value)
+        return value
+
+    def _offload_long_video_frame_output(self, out):
+        # Only the spatial-memory tensors are offloaded: both read sites reload
+        # them with ``.cuda(non_blocking=True)`` (see sam3_tracker_base.py:656,
+        # video_tracking_multiplex.py:1405/1424), so this is lossless. obj_ptr /
+        # pred_masks are left untouched since they are consumed on-device.
+        if not isinstance(out, dict):
+            return
+        for key in ("maskmem_features", "maskmem_pos_enc"):
+            if key in out:
+                out[key] = self._to_cpu_recursive(out[key])
+
+    def _prune_frame_output_map(
+        self, frame_map, cond_frames, should_delete, should_offload
+    ):
+        if not isinstance(frame_map, dict):
+            return
+        for old_frame_idx in list(frame_map.keys()):
+            if should_delete(old_frame_idx, cond_frames):
+                frame_map.pop(old_frame_idx, None)
+            elif should_offload(old_frame_idx, cond_frames):
+                self._offload_long_video_frame_output(frame_map.get(old_frame_idx))
 
     def _prune_long_video_state_dict(
         self,
         state,
         cache_outputs,
         should_prune,
+        should_delete,
+        should_offload,
     ):
         output_dict = state.get("output_dict")
         cond_frames = set()
-        pruned_frames = set()
         if isinstance(output_dict, dict):
             cond_frames = set(output_dict.get("cond_frame_outputs", {}).keys())
-            non_cond_outputs = output_dict.get("non_cond_frame_outputs", {})
-            for old_frame_idx in list(non_cond_outputs.keys()):
-                if should_prune(old_frame_idx, cond_frames):
-                    non_cond_outputs.pop(old_frame_idx, None)
-                    pruned_frames.add(old_frame_idx)
 
         consolidated = state.get("consolidated_frame_inds")
         if isinstance(consolidated, dict):
             cond_frames.update(consolidated.get("cond_frame_outputs", set()))
 
-        if pruned_frames:
-            for per_obj_key in ("output_dict_per_obj", "temp_output_dict_per_obj"):
-                for obj_output_dict in state.get(per_obj_key, {}).values():
-                    for storage_key in (
-                        "non_cond_frame_outputs",
-                        "cond_frame_outputs",
-                    ):
-                        storage = obj_output_dict.get(storage_key, {})
-                        for old_frame_idx in pruned_frames:
-                            if old_frame_idx not in cond_frames:
-                                storage.pop(old_frame_idx, None)
+        # Frame outputs: delete beyond lookback, offload spatial memory in between.
+        if isinstance(output_dict, dict):
+            self._prune_frame_output_map(
+                output_dict.get("non_cond_frame_outputs"),
+                cond_frames,
+                should_delete,
+                should_offload,
+            )
+        for per_obj_key in ("output_dict_per_obj", "temp_output_dict_per_obj"):
+            for obj_output_dict in state.get(per_obj_key, {}).values():
+                self._prune_frame_output_map(
+                    obj_output_dict.get("non_cond_frame_outputs"),
+                    cond_frames,
+                    should_delete,
+                    should_offload,
+                )
 
-            frames_already_tracked = state.get("frames_already_tracked")
-            if isinstance(frames_already_tracked, dict):
-                for old_frame_idx in pruned_frames:
+        frames_already_tracked = state.get("frames_already_tracked")
+        if isinstance(frames_already_tracked, dict):
+            for old_frame_idx in list(frames_already_tracked.keys()):
+                if should_delete(old_frame_idx, cond_frames):
                     frames_already_tracked.pop(old_frame_idx, None)
 
         cached_frame_outputs = state.get("cached_frame_outputs")

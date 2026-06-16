@@ -8,7 +8,8 @@ import queue
 import re
 import time
 import types
-from threading import Condition, get_ident, Lock, Thread
+import weakref
+from threading import Condition, Event, get_ident, Lock, Thread
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -499,35 +500,56 @@ class AsyncImageFrameLoader:
         return self
 
 
-class LazyImageFrameLoader:
+class _BoundedPrefetchFrameStore:
     """
-    Image-folder frame store for long-video mode.
+    Mixin: bounded LRU frame cache + background sliding-window prefetch thread.
 
-    Unlike AsyncImageFrameLoader, this does not start a background thread that
-    eventually fills the whole video in memory.
+    Long-video mode decodes frames on demand instead of materializing the whole
+    [T, C, H, W] tensor. A small prefetch thread decodes a window of frames ahead
+    of the most recent request so frame I/O overlaps GPU compute (recovering the
+    overlap the synchronous lazy loader gave up), while the LRU cache keeps peak
+    memory bounded at O(prefetch_window + keep_behind).
+
+    Subclasses must call ``_init_prefetch(...)``, set ``self._num_frames``,
+    implement ``_decode_frame(index) -> torch.Tensor``, and call
+    ``_start_prefetch()`` once the first frame is decoded.
     """
 
-    def __init__(
-        self,
-        img_paths,
-        image_size,
-        offload_video_to_cpu,
-        img_mean,
-        img_std,
-        max_cached_frames=2,
-    ):
-        self.img_paths = img_paths
-        self.image_size = image_size
-        self.offload_video_to_cpu = offload_video_to_cpu
-        self.img_mean = img_mean
-        self.img_std = img_std
-        self.max_cached_frames = max_cached_frames
+    def _init_prefetch(self, prefetch_window=8, keep_behind=2, decode_lock=None):
+        self.prefetch_window = max(int(prefetch_window), 0)
+        self.keep_behind = max(int(keep_behind), 0)
+        self.capacity = self.prefetch_window + self.keep_behind + 2
         self.cache = {}
         self.cache_order = []
-        self.video_height = None
-        self.video_width = None
-        first_img = self[0]
-        del first_img
+        self.exception = None
+        self._num_frames = 0
+        self._decode_lock = decode_lock if decode_lock is not None else FIFOLock()
+        self._cache_lock = Lock()
+        self._current_index = 0
+        self._direction = 1
+        self._wake = Event()
+        self._stop = Event()
+        self._thread = None
+
+    def _start_prefetch(self):
+        if self.prefetch_window <= 0 or self._thread is not None:
+            return
+        # The thread holds only a weakref to self (plus the two small events), so
+        # it does not keep the loader alive; it exits within ~1s of the loader
+        # being dropped or close()d.
+        self._thread = Thread(
+            target=self._prefetch_main,
+            args=(weakref.ref(self), self._stop, self._wake),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    @property
+    def tensors(self):
+        return self
 
     def __getitem__(self, index):
         if isinstance(index, torch.Tensor):
@@ -537,14 +559,140 @@ class LazyImageFrameLoader:
         if isinstance(index, list):
             return torch.stack([self[i] for i in index])
         if index < 0:
-            index += len(self.img_paths)
-        if index >= len(self.img_paths) or index < 0:
+            index += self._num_frames
+        if index < 0 or index >= self._num_frames:
             raise IndexError(
-                f"Index {index} is out of bounds; length is {len(self.img_paths)}"
+                f"Index {index} is out of bounds; length is {self._num_frames}"
             )
-        cached = self.cache.get(index)
-        if cached is not None:
-            return cached
+        prev = self._current_index
+        self._current_index = index
+        if index != prev:
+            self._direction = 1 if index >= prev else -1
+        self._wake.set()
+        return self._get(index)
+
+    def _get(self, index):
+        frame = self._cache_get(index)
+        if frame is not None:
+            return frame
+        if self.exception is not None:
+            raise RuntimeError("Failure in frame prefetch thread") from self.exception
+        with self._decode_lock:
+            frame = self._cache_get(index)
+            if frame is not None:
+                return frame
+            frame = self._decode_frame(index)
+            self._cache_put(index, frame)
+            return frame
+
+    def _cache_get(self, index):
+        with self._cache_lock:
+            frame = self.cache.get(index)
+            if frame is not None:
+                try:
+                    self.cache_order.remove(index)
+                except ValueError:
+                    pass
+                self.cache_order.append(index)
+            return frame
+
+    def _cache_put(self, index, frame):
+        if self.capacity <= 0:
+            return
+        with self._cache_lock:
+            self.cache[index] = frame
+            try:
+                self.cache_order.remove(index)
+            except ValueError:
+                pass
+            self.cache_order.append(index)
+            while len(self.cache_order) > self.capacity:
+                old_index = self.cache_order.pop(0)
+                self.cache.pop(old_index, None)
+
+    @staticmethod
+    def _prefetch_main(self_ref, stop, wake):
+        while not stop.is_set():
+            if not wake.wait(timeout=1.0):
+                continue
+            wake.clear()
+            if stop.is_set():
+                return
+            store = self_ref()
+            if store is None:
+                return
+            try:
+                store._prefetch_window_once()
+            except Exception as exc:  # surfaced on the next __getitem__
+                store.exception = exc
+                return
+            del store
+
+    def _prefetch_window_once(self):
+        start = self._current_index
+        step = self._direction or 1
+        decoded = 0
+        i = start + step
+        while 0 <= i < self._num_frames and decoded < self.prefetch_window:
+            if self._stop.is_set():
+                return
+            # If the consumer jumped elsewhere, abandon this window and re-arm.
+            if self._current_index != start:
+                self._wake.set()
+                return
+            if self._cache_get(i) is None:
+                with self._decode_lock:
+                    if self._cache_get(i) is None:
+                        self._cache_put(i, self._decode_frame(i))
+            i += step
+            decoded += 1
+
+    def _decode_frame(self, index):  # pragma: no cover - implemented by subclasses
+        raise NotImplementedError
+
+    def close(self):
+        self._stop.set()
+        self._wake.set()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class LazyImageFrameLoader(_BoundedPrefetchFrameStore):
+    """
+    Image-folder frame store for long-video mode.
+
+    Unlike AsyncImageFrameLoader, this never materializes the whole video; it
+    keeps a bounded LRU cache and prefetches a small window ahead of the cursor.
+    """
+
+    def __init__(
+        self,
+        img_paths,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        prefetch_window=8,
+        keep_behind=2,
+    ):
+        self._init_prefetch(prefetch_window, keep_behind)
+        self.img_paths = img_paths
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.img_mean = img_mean
+        self.img_std = img_std
+        self.video_height = None
+        self.video_width = None
+        self._num_frames = len(img_paths)
+        # decode the first frame eagerly to fill video_height/width and warm cache
+        self._cache_put(0, self._decode_frame(0))
+        self._start_prefetch()
+
+    def _decode_frame(self, index):
         img, video_height, video_width = _load_img_as_tensor(
             self.img_paths[index], self.image_size
         )
@@ -555,24 +703,7 @@ class LazyImageFrameLoader:
         img /= self.img_std
         if not self.offload_video_to_cpu:
             img = img.cuda()
-        self._cache_frame(index, img)
         return img
-
-    def _cache_frame(self, index, img):
-        if self.max_cached_frames <= 0:
-            return
-        self.cache[index] = img
-        self.cache_order.append(index)
-        while len(self.cache_order) > self.max_cached_frames:
-            old_index = self.cache_order.pop(0)
-            self.cache.pop(old_index, None)
-
-    def __len__(self) -> int:
-        return len(self.img_paths)
-
-    @property
-    def tensors(self):
-        return self
 
 
 class TorchCodecDecoder:
@@ -633,13 +764,14 @@ class TorchCodecDecoder:
         return frame_data
 
 
-class LazyVideoFileLoaderWithTorchCodec:
+class LazyVideoFileLoaderWithTorchCodec(_BoundedPrefetchFrameStore):
     """
     TorchCodec-backed frame store for long-video mode.
 
     This intentionally does not preallocate a [T, C, H, W] tensor. Frames are
-    decoded and normalized on demand, with a tiny cache for repeated prompt or
-    propagation access around the current frame.
+    decoded and normalized on demand, with a bounded LRU cache and a small
+    sliding-window prefetch thread so decode overlaps GPU compute. TorchCodec
+    access is serialized through the prefetch store's FIFO decode lock.
     """
 
     def __init__(
@@ -651,9 +783,11 @@ class LazyVideoFileLoaderWithTorchCodec:
         img_std: Union[tuple[float, float, float], torch.Tensor],
         gpu_acceleration: bool = False,
         gpu_device: Optional[torch.device] = None,
-        max_cached_frames: int = 2,
+        prefetch_window: int = 8,
+        keep_behind: int = 2,
     ) -> None:
         assert gpu_device is None or gpu_device.type == "cuda"
+        self._init_prefetch(prefetch_window, keep_behind)
         if gpu_device is not None and gpu_device.index is not None:
             gpu_id = gpu_device.index
         elif gpu_acceleration:
@@ -669,10 +803,6 @@ class LazyVideoFileLoaderWithTorchCodec:
         self.gpu_id = gpu_id
         self.image_size = image_size
         self.offload_video_to_cpu = offload_video_to_cpu
-        self.max_cached_frames = max_cached_frames
-        self.cache = {}
-        self.cache_order = []
-        self.torchcodec_access_lock = FIFOLock()
 
         if not isinstance(img_mean, torch.Tensor):
             img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
@@ -694,49 +824,19 @@ class LazyVideoFileLoaderWithTorchCodec:
                 "long_video_mode for video files requires TorchCodec. "
                 "Install torchcodec or use an image-folder input."
             ) from exc
-        self.num_frames = len(self.reader)
+        self._num_frames = len(self.reader)
         self.video_height = self.reader.metadata.height
         self.video_width = self.reader.metadata.width
+        # decode the first frame eagerly to warm the cache, then start prefetch
+        self._cache_put(0, self._decode_frame(0))
+        self._start_prefetch()
 
     @property
-    def tensors(self):
-        return self
+    def num_frames(self) -> int:
+        return self._num_frames
 
-    def __len__(self) -> int:
-        return self.num_frames
-
-    def __getitem__(self, index):
-        if isinstance(index, torch.Tensor):
-            index = index.tolist()
-        if isinstance(index, slice):
-            return torch.stack([self[i] for i in range(*index.indices(len(self)))])
-        if isinstance(index, list):
-            return torch.stack([self[i] for i in index])
-        if index < 0:
-            index += self.num_frames
-        if index >= self.num_frames or index < 0:
-            raise IndexError(
-                f"Index {index} is out of bounds; length is {self.num_frames}"
-            )
-        cached = self.cache.get(index)
-        if cached is not None:
-            return cached
-        with self.torchcodec_access_lock:
-            cached = self.cache.get(index)
-            if cached is not None:
-                return cached
-            frame = self._transform_frame(self.reader[index])
-            self._cache_frame(index, frame)
-            return frame
-
-    def _cache_frame(self, index: int, frame: torch.Tensor) -> None:
-        if self.max_cached_frames <= 0:
-            return
-        self.cache[index] = frame
-        self.cache_order.append(index)
-        while len(self.cache_order) > self.max_cached_frames:
-            old_index = self.cache_order.pop(0)
-            self.cache.pop(old_index, None)
+    def _decode_frame(self, index):
+        return self._transform_frame(self.reader[index])
 
     def _transform_frame(self, frame):
         frame = frame.clone().float()
