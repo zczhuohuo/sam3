@@ -63,8 +63,8 @@ class Sam3VideoInference(Sam3VideoBase):
         long_video_history_frames=32,
         long_video_loader_type="auto",
         long_video_cache_outputs=False,
-        long_video_postprocess_batch_size=1,
-        long_video_grounding_batch_size=4,
+        long_video_postprocess_batch_size=None,
+        long_video_grounding_batch_size=None,
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
         images, orig_height, orig_width = load_resource_as_video_frames(
@@ -101,8 +101,8 @@ class Sam3VideoInference(Sam3VideoBase):
             "history_frames": int(long_video_history_frames),
             "loader_type": long_video_loader_type,
             "cache_outputs": bool(long_video_cache_outputs),
-            "postprocess_batch_size": int(long_video_postprocess_batch_size),
-            "grounding_batch_size": int(long_video_grounding_batch_size),
+            "postprocess_batch_size": long_video_postprocess_batch_size,
+            "grounding_batch_size": long_video_grounding_batch_size,
         }
         return inference_state
 

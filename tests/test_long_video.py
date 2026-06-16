@@ -5,6 +5,7 @@ from PIL import Image
 from sam3.model import io_utils
 from sam3.model.io_utils import LazyImageFrameLoader
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
+from sam3.model.sam3_multiplex_tracking import Sam3MultiplexTrackingWithInteractivity
 
 
 def _frame_out(frame_idx):
@@ -155,8 +156,8 @@ class StreamingFakeModel:
         long_video_history_frames=32,
         long_video_loader_type="auto",
         long_video_cache_outputs=False,
-        long_video_postprocess_batch_size=1,
-        long_video_grounding_batch_size=4,
+        long_video_postprocess_batch_size=None,
+        long_video_grounding_batch_size=None,
         async_loading_frames=False,
         video_loader_type="cv2",
     ):
@@ -226,6 +227,23 @@ def test_streaming_long_video_state_stays_bounded():
     assert predictor.model.batched_grounding_batch_size == 16
 
 
+def test_long_video_runtime_overrides_are_opt_in():
+    predictor = Sam3BasePredictor()
+    predictor.model = StreamingFakeModel()
+    predictor.start_session(
+        "video.mp4",
+        session_id="s",
+        long_video_mode=True,
+        long_video_history_frames=2,
+    )
+
+    list(predictor.propagate_in_video("s", propagation_direction="forward"))
+
+    assert predictor.model.seen_runtime_values == [(16, 16)] * 6
+    assert predictor.model.postprocess_batch_size == 16
+    assert predictor.model.batched_grounding_batch_size == 16
+
+
 def test_long_video_image_folder_uses_lazy_loader(tmp_path):
     for idx in range(2):
         Image.new("RGB", (4, 4), color=(idx, idx, idx)).save(tmp_path / f"{idx}.jpg")
@@ -289,3 +307,62 @@ def test_long_video_video_file_requires_torchcodec(monkeypatch):
             offload_video_to_cpu=True,
             long_video_mode=True,
         )
+
+
+def test_multiplex_interactivity_init_forwards_long_video_loader_options(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeFrames:
+        def __len__(self):
+            return 3
+
+    class FakeTracker:
+        per_obj_inference = False
+
+    def fake_load_resource_as_video_frames(**kwargs):
+        captured.update(kwargs)
+        return FakeFrames(), 10, 20
+
+    monkeypatch.setattr(
+        "sam3.model.sam3_multiplex_tracking.load_resource_as_video_frames",
+        fake_load_resource_as_video_frames,
+    )
+
+    model = object.__new__(Sam3MultiplexTrackingWithInteractivity)
+    model.image_size = 8
+    model.image_mean = (0.5, 0.5, 0.5)
+    model.image_std = (0.5, 0.5, 0.5)
+    model.tracker = FakeTracker()
+    model._construct_initial_input_batch = (
+        lambda inference_state, images: inference_state.update(
+            {"loaded_images": images}
+        )
+    )
+
+    state = model.init_state(
+        resource_path="clip.mp4",
+        offload_video_to_cpu=True,
+        async_loading_frames=True,
+        long_video_mode=True,
+        long_video_history_frames=7,
+        long_video_loader_type="torchcodec",
+        long_video_cache_outputs=True,
+        long_video_postprocess_batch_size=2,
+        long_video_grounding_batch_size=5,
+    )
+
+    assert captured["long_video_mode"] is True
+    assert captured["long_video_loader_type"] == "torchcodec"
+    assert captured["offload_video_to_cpu"] is True
+    assert captured["async_loading_frames"] is True
+    assert state["num_frames"] == 3
+    assert state["long_video"] == {
+        "enabled": True,
+        "history_frames": 7,
+        "loader_type": "torchcodec",
+        "cache_outputs": True,
+        "postprocess_batch_size": 2,
+        "grounding_batch_size": 5,
+    }

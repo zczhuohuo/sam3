@@ -212,6 +212,12 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        long_video_mode=False,
+        long_video_history_frames=32,
+        long_video_loader_type="auto",
+        long_video_cache_outputs=False,
+        long_video_postprocess_batch_size=None,
+        long_video_grounding_batch_size=None,
     ):
         # Initialize inference state (inlined from Sam3DemoMixin.init_state)
         if use_torchcodec:
@@ -228,6 +234,8 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            long_video_mode=long_video_mode,
+            long_video_loader_type=long_video_loader_type,
         )
         inference_state = {}
         inference_state["image_size"] = self.image_size
@@ -246,6 +254,14 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         inference_state["feature_cache"] = {}
         inference_state["cached_frame_outputs"] = {}
         inference_state["is_image_only"] = is_image_type(resource_path)
+        inference_state["long_video"] = {
+            "enabled": bool(long_video_mode),
+            "history_frames": int(long_video_history_frames),
+            "loader_type": long_video_loader_type,
+            "cache_outputs": bool(long_video_cache_outputs),
+            "postprocess_batch_size": long_video_postprocess_batch_size,
+            "grounding_batch_size": long_video_grounding_batch_size,
+        }
         return inference_state
 
     def reset_state(self, inference_state):
@@ -1841,6 +1857,12 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        long_video_mode=False,
+        long_video_history_frames=32,
+        long_video_loader_type="auto",
+        long_video_cache_outputs=False,
+        long_video_postprocess_batch_size=None,
+        long_video_grounding_batch_size=None,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
@@ -1849,6 +1871,12 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
             input_is_mp4=input_is_mp4,
+            long_video_mode=long_video_mode,
+            long_video_history_frames=long_video_history_frames,
+            long_video_loader_type=long_video_loader_type,
+            long_video_cache_outputs=long_video_cache_outputs,
+            long_video_postprocess_batch_size=long_video_postprocess_batch_size,
+            long_video_grounding_batch_size=long_video_grounding_batch_size,
         )
         # Initialize generator state for batched processing
         inference_state["generator_state"] = {
@@ -2222,6 +2250,12 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        long_video_mode=False,
+        long_video_history_frames=32,
+        long_video_loader_type="auto",
+        long_video_cache_outputs=False,
+        long_video_postprocess_batch_size=None,
+        long_video_grounding_batch_size=None,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
@@ -2230,6 +2264,12 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
             input_is_mp4=input_is_mp4,
+            long_video_mode=long_video_mode,
+            long_video_history_frames=long_video_history_frames,
+            long_video_loader_type=long_video_loader_type,
+            long_video_cache_outputs=long_video_cache_outputs,
+            long_video_postprocess_batch_size=long_video_postprocess_batch_size,
+            long_video_grounding_batch_size=long_video_grounding_batch_size,
         )
         # initialize extra states
         inference_state["action_history"] = []  # for logging user actions

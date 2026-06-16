@@ -72,10 +72,10 @@ class Sam3BasePredictor:
                     "long_video_cache_outputs", False
                 ),
                 long_video_postprocess_batch_size=request.get(
-                    "long_video_postprocess_batch_size", 1
+                    "long_video_postprocess_batch_size", None
                 ),
                 long_video_grounding_batch_size=request.get(
-                    "long_video_grounding_batch_size", 4
+                    "long_video_grounding_batch_size", None
                 ),
             )
         elif request_type == "add_prompt":
@@ -147,8 +147,8 @@ class Sam3BasePredictor:
         long_video_history_frames=32,
         long_video_loader_type="auto",
         long_video_cache_outputs=False,
-        long_video_postprocess_batch_size=1,
-        long_video_grounding_batch_size=4,
+        long_video_postprocess_batch_size=None,
+        long_video_grounding_batch_size=None,
     ):
         """Start a new inference session on a video directory or path."""
         if offload_video_to_cpu is None:
@@ -215,8 +215,8 @@ class Sam3BasePredictor:
                 "history_frames": int(long_video_history_frames),
                 "loader_type": long_video_loader_type,
                 "cache_outputs": bool(long_video_cache_outputs),
-                "postprocess_batch_size": int(long_video_postprocess_batch_size),
-                "grounding_batch_size": int(long_video_grounding_batch_size),
+                "postprocess_batch_size": long_video_postprocess_batch_size,
+                "grounding_batch_size": long_video_grounding_batch_size,
             },
         )
 
@@ -400,15 +400,14 @@ class Sam3BasePredictor:
             return lambda: None
 
         overrides = {
-            "postprocess_batch_size": int(
-                long_video.get("postprocess_batch_size", 1)
-            ),
-            "batched_grounding_batch_size": int(
-                long_video.get("grounding_batch_size", 4)
-            ),
+            "postprocess_batch_size": long_video.get("postprocess_batch_size"),
+            "batched_grounding_batch_size": long_video.get("grounding_batch_size"),
         }
         original_values = {}
         for attr_name, override_value in overrides.items():
+            if override_value is None:
+                continue
+            override_value = int(override_value)
             if override_value < 1 or not hasattr(self.model, attr_name):
                 continue
             original_values[attr_name] = getattr(self.model, attr_name)
