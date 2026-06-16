@@ -6,7 +6,10 @@ from PIL import Image
 from sam3.model import io_utils
 from sam3.model.io_utils import LazyImageFrameLoader
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
-from sam3.model.sam3_multiplex_tracking import Sam3MultiplexTrackingWithInteractivity
+from sam3.model.sam3_multiplex_tracking import (
+    Sam3MultiplexTracking,
+    Sam3MultiplexTrackingWithInteractivity,
+)
 
 
 def _frame_out(frame_idx):
@@ -418,6 +421,184 @@ def test_long_video_active_window_is_disabled_outside_long_video_mode():
     assert predictor.model.removed_objects == []
 
 
+def test_base_predictor_skips_active_window_when_model_manages_it():
+    predictor = Sam3BasePredictor()
+    predictor.model = ActiveObjectWindowFakeModel(
+        [
+            (0, [6], [6], {6: 0.9}),
+            (1, [6], [6], {6: 0.2}),
+            (2, [6], [6], {6: 0.2}),
+        ]
+    )
+    predictor.start_session(
+        "video.mp4",
+        session_id="s",
+        long_video_mode=True,
+        long_video_history_frames=2,
+    )
+    state = predictor._all_inference_states["s"]["state"]
+    state["long_video"]["active_window_managed_in_model"] = True
+
+    list(
+        predictor.propagate_in_video(
+            "s", propagation_direction="forward", output_prob_thresh=0.5
+        )
+    )
+
+    assert predictor.model.removed_objects == []
+
+
+class InternalActiveWindowFakeMultiplex(Sam3MultiplexTracking):
+    def __init__(self, frame_scores):
+        self.frame_scores = frame_scores
+        self.capacity_prev_counts = []
+        self.removed_objects = []
+        self.rank = 0
+        self.hotstart_delay = 0
+        self.postprocess_batch_size = 16
+        self.masklet_confirmation_consecutive_det_thresh = 1
+        self.is_multiplex = False
+
+    def _compile_model(self):
+        return None
+
+    def _get_processing_order(
+        self,
+        inference_state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        return range(len(self.frame_scores)), len(self.frame_scores) - 1
+
+    def _run_single_frame_inference(
+        self,
+        inference_state,
+        frame_idx,
+        reverse,
+        is_instance_processing=False,
+    ):
+        tracker_metadata = inference_state["tracker_metadata"]
+        tracked_obj_ids = tracker_metadata["obj_ids_all_gpu"]
+        self.capacity_prev_counts.append((frame_idx, len(tracked_obj_ids)))
+        scores = {
+            obj_id: torch.tensor(score, dtype=torch.float32)
+            for obj_id, score in self.frame_scores[frame_idx].items()
+        }
+        tracker_metadata["obj_id_to_sam2_score_frame_wise"][frame_idx] = scores
+        return {
+            "obj_id_to_mask": {
+                obj_id: torch.ones(1, 1, 1, dtype=torch.bool)
+                for obj_id in tracked_obj_ids.tolist()
+            },
+            "obj_id_to_score": {},
+            "obj_id_to_sam2_score": scores,
+            "removed_obj_ids": set(),
+            "suppressed_obj_ids": set(),
+            "frame_stats": {},
+        }
+
+    def _cache_frame_outputs(
+        self,
+        inference_state,
+        frame_idx,
+        obj_id_to_mask,
+        suppressed_obj_ids=None,
+        removed_obj_ids=None,
+        unconfirmed_obj_ids=None,
+    ):
+        return None
+
+    def _postprocess_output_batched(self, H_video, W_video, batched_outs):
+        outputs = []
+        for out, _, _, _ in batched_outs:
+            outputs.append(
+                {
+                    "out_obj_ids": np.array(
+                        sorted(out["obj_id_to_mask"].keys()), dtype=np.int64
+                    ),
+                    "out_probs": np.zeros(
+                        len(out["obj_id_to_mask"]), dtype=np.float32
+                    ),
+                    "out_boxes_xywh": np.zeros(
+                        (len(out["obj_id_to_mask"]), 4), dtype=np.float32
+                    ),
+                    "out_binary_masks": np.zeros(
+                        (len(out["obj_id_to_mask"]), H_video, W_video), dtype=bool
+                    ),
+                    "frame_stats": out["frame_stats"],
+                }
+            )
+        return outputs
+
+    def remove_object(
+        self,
+        inference_state,
+        obj_id,
+        frame_idx,
+        is_user_action=False,
+    ):
+        self.removed_objects.append((obj_id, frame_idx, is_user_action))
+        tracker_metadata = inference_state["tracker_metadata"]
+        remaining_obj_ids = tracker_metadata["obj_ids_all_gpu"][
+            tracker_metadata["obj_ids_all_gpu"] != obj_id
+        ]
+        tracker_metadata["obj_ids_all_gpu"] = remaining_obj_ids
+        tracker_metadata["obj_ids_per_gpu"] = [remaining_obj_ids]
+        tracker_metadata["num_obj_per_gpu"] = [len(remaining_obj_ids)]
+        tracker_metadata["obj_id_to_score"].pop(obj_id, None)
+        return None
+
+
+def _internal_active_window_state():
+    return {
+        "long_video": {
+            "enabled": True,
+            "history_frames": 2,
+            "active_window_managed_in_model": True,
+            "object_last_output_frame": {},
+            "object_first_seen_frame": {},
+            "removed_inactive_object_ids": set(),
+        },
+        "tracker_metadata": {
+            "obj_ids_all_gpu": np.array([5], dtype=np.int64),
+            "obj_ids_per_gpu": [np.array([5], dtype=np.int64)],
+            "num_obj_per_gpu": [1],
+            "obj_id_to_score": {5: 1.0},
+            "obj_id_to_sam2_score_frame_wise": {},
+        },
+        "feature_cache": {},
+        "num_frames": 3,
+        "orig_height": 1,
+        "orig_width": 1,
+    }
+
+
+def test_multiplex_active_window_prunes_before_next_frame_capacity_check():
+    model = InternalActiveWindowFakeMultiplex(
+        [
+            {5: 0.9},
+            {5: 0.2},
+            {},
+        ]
+    )
+    state = _internal_active_window_state()
+
+    outputs = list(
+        model.propagate_in_video(
+            state,
+            start_frame_idx=0,
+            max_frame_num_to_track=3,
+            reverse=False,
+            output_prob_thresh=0.5,
+        )
+    )
+
+    assert model.capacity_prev_counts == [(0, 1), (1, 1), (2, 0)]
+    assert model.removed_objects == [(5, None, False)]
+    assert [frame_idx for frame_idx, _ in outputs] == [0, 1, 2]
+
+
 def test_long_video_runtime_overrides_are_opt_in():
     predictor = Sam3BasePredictor()
     predictor.model = StreamingFakeModel()
@@ -558,6 +739,10 @@ def test_multiplex_interactivity_init_forwards_long_video_loader_options(
         "cache_outputs": True,
         "postprocess_batch_size": 2,
         "grounding_batch_size": 5,
+        "active_window_managed_in_model": True,
+        "object_last_output_frame": {},
+        "object_first_seen_frame": {},
+        "removed_inactive_object_ids": set(),
     }
 
 

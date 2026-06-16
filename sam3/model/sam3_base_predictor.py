@@ -443,6 +443,8 @@ class Sam3BasePredictor:
         long_video = inference_state.get("long_video") or {}
         if not long_video.get("enabled", False):
             return
+        if long_video.get("active_window_managed_in_model", False):
+            return
         if not hasattr(self.model, "remove_object"):
             return
 

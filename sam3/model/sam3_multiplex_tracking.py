@@ -263,6 +263,10 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             "cache_outputs": bool(long_video_cache_outputs),
             "postprocess_batch_size": long_video_postprocess_batch_size,
             "grounding_batch_size": long_video_grounding_batch_size,
+            "active_window_managed_in_model": True,
+            "object_last_output_frame": {},
+            "object_first_seen_frame": {},
+            "removed_inactive_object_ids": set(),
         }
         return inference_state
 
@@ -286,6 +290,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         inference_state["tracker_metadata"].clear()
         inference_state["feature_cache"].clear()
         inference_state["cached_frame_outputs"] = {}
+        self._reset_long_video_active_window(inference_state)
 
     def _get_processing_order(
         self, inference_state, start_frame_idx, max_frame_num_to_track, reverse
@@ -366,11 +371,17 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         for frame_idx in tqdm(
             processing_order, desc="propagate_in_video", disable=self.rank > 0
         ):
+            self._prune_long_video_inactive_objects_before_frame(
+                inference_state, frame_idx, reverse
+            )
             out = self._run_single_frame_inference(
                 inference_state,
                 frame_idx,
                 reverse,
                 is_instance_processing=is_instance_processing,
+            )
+            self._record_long_video_active_scores_after_frame(
+                inference_state, frame_idx, output_prob_thresh
             )
 
             if self.hotstart_delay > 0:
@@ -598,6 +609,174 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 logger.info(
                     f"Bucket utilization rate: {bucket_utilization_rate:.2f}%, subscription rate: {subscription_rate:.2f}%"
                 )
+
+    def _reset_long_video_active_window(self, inference_state):
+        long_video = inference_state.get("long_video")
+        if not isinstance(long_video, dict):
+            return
+        long_video["object_last_output_frame"] = {}
+        long_video["object_first_seen_frame"] = {}
+        long_video["removed_inactive_object_ids"] = set()
+
+    def _prune_long_video_inactive_objects_before_frame(
+        self, inference_state, frame_idx, reverse
+    ):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return
+        if not hasattr(self, "remove_object"):
+            return
+
+        tracker_metadata = inference_state.get("tracker_metadata")
+        if not isinstance(tracker_metadata, dict):
+            return
+
+        tracked_obj_ids = self._normalize_long_video_obj_ids(
+            tracker_metadata.get("obj_ids_all_gpu")
+        )
+        if not tracked_obj_ids:
+            return
+
+        history_frames = int(long_video.get("history_frames", 32))
+        first_seen = long_video.setdefault("object_first_seen_frame", {})
+        last_output = long_video.setdefault("object_last_output_frame", {})
+        removed = long_video.setdefault("removed_inactive_object_ids", set())
+
+        for obj_id in tracked_obj_ids:
+            if obj_id not in removed:
+                first_seen.setdefault(obj_id, frame_idx)
+
+        stale_obj_ids = []
+        for obj_id in tracked_obj_ids:
+            if obj_id in removed:
+                continue
+            reference_frame = last_output.get(obj_id, first_seen.get(obj_id, frame_idx))
+            if self._long_video_object_is_stale(
+                reference_frame, frame_idx, history_frames, reverse
+            ):
+                stale_obj_ids.append(obj_id)
+
+        for obj_id in stale_obj_ids:
+            self.remove_object(
+                inference_state,
+                obj_id,
+                frame_idx=None,
+                is_user_action=False,
+            )
+            removed.add(obj_id)
+            first_seen.pop(obj_id, None)
+            last_output.pop(obj_id, None)
+
+    def _record_long_video_active_scores_after_frame(
+        self, inference_state, frame_idx, output_prob_thresh
+    ):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return
+
+        tracker_metadata = inference_state.get("tracker_metadata")
+        if not isinstance(tracker_metadata, dict):
+            return
+
+        tracked_obj_ids = self._normalize_long_video_obj_ids(
+            tracker_metadata.get("obj_ids_all_gpu")
+        )
+        if not tracked_obj_ids:
+            return
+
+        first_seen = long_video.setdefault("object_first_seen_frame", {})
+        last_output = long_video.setdefault("object_last_output_frame", {})
+        removed = long_video.setdefault("removed_inactive_object_ids", set())
+
+        for obj_id in tracked_obj_ids:
+            if obj_id in removed:
+                continue
+            first_seen.setdefault(obj_id, frame_idx)
+
+        frame_scores = self._get_long_video_frame_scores(tracker_metadata, frame_idx)
+        if not frame_scores:
+            return
+
+        for obj_id in tracked_obj_ids:
+            if obj_id in removed:
+                continue
+            if obj_id not in frame_scores:
+                continue
+            if self._long_video_score_passes_threshold(
+                frame_scores[obj_id], output_prob_thresh
+            ):
+                last_output[obj_id] = frame_idx
+
+    def _long_video_object_is_stale(
+        self, reference_frame, frame_idx, history_frames, reverse
+    ):
+        if reverse:
+            return reference_frame > frame_idx + history_frames - 1
+        return reference_frame < frame_idx - history_frames + 1
+
+    def _get_long_video_frame_scores(self, tracker_metadata, frame_idx):
+        score_map = tracker_metadata.get("obj_id_to_sam2_score_frame_wise")
+        if not isinstance(score_map, dict):
+            return {}
+        frame_scores = score_map.get(frame_idx)
+        if not isinstance(frame_scores, dict):
+            return {}
+        return {
+            obj_id: score
+            for obj_id, score in (
+                (self._normalize_long_video_obj_id(obj_id), score)
+                for obj_id, score in frame_scores.items()
+            )
+            if obj_id is not None
+        }
+
+    def _long_video_score_passes_threshold(self, score, output_prob_thresh):
+        score = self._normalize_long_video_score(score)
+        return score is not None and score >= float(output_prob_thresh)
+
+    def _normalize_long_video_score(self, score):
+        if score is None:
+            return None
+        if isinstance(score, torch.Tensor):
+            if score.numel() == 0:
+                return None
+            score = score.detach().float().reshape(-1)[0].item()
+        elif hasattr(score, "item"):
+            score = score.item()
+        try:
+            return float(score)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_long_video_obj_ids(self, obj_ids):
+        if obj_ids is None:
+            return []
+        if isinstance(obj_ids, torch.Tensor):
+            obj_ids = obj_ids.detach().cpu()
+        if hasattr(obj_ids, "tolist"):
+            obj_ids = obj_ids.tolist()
+        if not isinstance(obj_ids, (list, tuple, set)):
+            obj_ids = [obj_ids]
+
+        normalized = []
+        for obj_id in obj_ids:
+            if isinstance(obj_id, (list, tuple)):
+                normalized.extend(self._normalize_long_video_obj_ids(obj_id))
+                continue
+            if hasattr(obj_id, "item"):
+                obj_id = obj_id.item()
+            try:
+                obj_id = int(obj_id)
+            except (TypeError, ValueError):
+                continue
+            normalized.append(obj_id)
+        return normalized
+
+    def _normalize_long_video_obj_id(self, obj_id):
+        obj_ids = self._normalize_long_video_obj_ids(obj_id)
+        if not obj_ids:
+            return None
+        return obj_ids[0]
 
     def _run_single_frame_inference(
         self,
@@ -1968,11 +2147,17 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         for frame_idx in tqdm(
             processing_order, desc="propagate_in_video", disable=self.rank > 0
         ):
+            self._prune_long_video_inactive_objects_before_frame(
+                inference_state, frame_idx, reverse
+            )
             out = self._run_single_frame_inference(
                 inference_state,
                 frame_idx,
                 reverse,
                 is_instance_processing=is_instance_processing,
+            )
+            self._record_long_video_active_scores_after_frame(
+                inference_state, frame_idx, output_prob_thresh
             )
 
             if self.hotstart_delay > 0:
