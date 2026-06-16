@@ -63,6 +63,8 @@ class Sam3VideoInference(Sam3VideoBase):
         long_video_history_frames=32,
         long_video_loader_type="auto",
         long_video_cache_outputs=False,
+        long_video_postprocess_batch_size=1,
+        long_video_grounding_batch_size=4,
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
         images, orig_height, orig_width = load_resource_as_video_frames(
@@ -99,6 +101,8 @@ class Sam3VideoInference(Sam3VideoBase):
             "history_frames": int(long_video_history_frames),
             "loader_type": long_video_loader_type,
             "cache_outputs": bool(long_video_cache_outputs),
+            "postprocess_batch_size": int(long_video_postprocess_batch_size),
+            "grounding_batch_size": int(long_video_grounding_batch_size),
         }
         return inference_state
 
@@ -786,7 +790,11 @@ class Sam3VideoInference(Sam3VideoBase):
             for i, obj_id in enumerate(new_det_obj_ids_local):
                 obj_id_to_mask[obj_id] = (video_res_masks[i] > 0.0).to(torch.bool)
         if self.rank == 0:
-            for fidx in range(inference_state["num_frames"]):
+            if (inference_state.get("long_video") or {}).get("enabled", False):
+                frame_indices_to_cache = [frame_idx]
+            else:
+                frame_indices_to_cache = range(inference_state["num_frames"])
+            for fidx in frame_indices_to_cache:
                 self._cache_frame_outputs(inference_state, fidx, obj_id_to_mask)
 
         inference_state["tracker_metadata"].update(

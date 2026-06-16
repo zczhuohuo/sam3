@@ -141,6 +141,11 @@ def test_start_session_compatibility_without_long_video_fields():
 
 
 class StreamingFakeModel:
+    def __init__(self):
+        self.postprocess_batch_size = 16
+        self.batched_grounding_batch_size = 16
+        self.seen_runtime_values = []
+
     def init_state(
         self,
         resource_path,
@@ -150,6 +155,8 @@ class StreamingFakeModel:
         long_video_history_frames=32,
         long_video_loader_type="auto",
         long_video_cache_outputs=False,
+        long_video_postprocess_batch_size=1,
+        long_video_grounding_batch_size=4,
         async_loading_frames=False,
         video_loader_type="cv2",
     ):
@@ -159,6 +166,8 @@ class StreamingFakeModel:
                 "history_frames": long_video_history_frames,
                 "loader_type": long_video_loader_type,
                 "cache_outputs": long_video_cache_outputs,
+                "postprocess_batch_size": long_video_postprocess_batch_size,
+                "grounding_batch_size": long_video_grounding_batch_size,
             },
             "output_dict": {
                 "cond_frame_outputs": {0: _frame_out(0)},
@@ -177,6 +186,9 @@ class StreamingFakeModel:
         reverse=False,
     ):
         for frame_idx in range(6):
+            self.seen_runtime_values.append(
+                (self.postprocess_batch_size, self.batched_grounding_batch_size)
+            )
             inference_state["output_dict"]["non_cond_frame_outputs"][
                 frame_idx
             ] = _frame_out(frame_idx)
@@ -195,6 +207,8 @@ def test_streaming_long_video_state_stays_bounded():
         session_id="s",
         long_video_mode=True,
         long_video_history_frames=2,
+        long_video_postprocess_batch_size=1,
+        long_video_grounding_batch_size=4,
     )
 
     outputs = list(
@@ -207,6 +221,9 @@ def test_streaming_long_video_state_stays_bounded():
     assert set(state["output_dict"]["non_cond_frame_outputs"]) == {0, 4, 5}
     assert set(state["cached_frame_outputs"]) == {0, 4, 5}
     assert set(k for k in state["feature_cache"] if isinstance(k, int)) == {0, 4, 5}
+    assert predictor.model.seen_runtime_values == [(1, 4)] * 6
+    assert predictor.model.postprocess_batch_size == 16
+    assert predictor.model.batched_grounding_batch_size == 16
 
 
 def test_long_video_image_folder_uses_lazy_loader(tmp_path):

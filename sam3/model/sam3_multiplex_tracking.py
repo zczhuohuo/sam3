@@ -1558,7 +1558,11 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             for i, obj_id in enumerate(new_det_obj_ids_local):
                 obj_id_to_mask[obj_id] = (video_res_masks[i] > 0.0).to(torch.bool)
         if self.rank == 0:
-            for fidx in range(inference_state["num_frames"]):
+            if (inference_state.get("long_video") or {}).get("enabled", False):
+                frame_indices_to_cache = [frame_idx]
+            else:
+                frame_indices_to_cache = range(inference_state["num_frames"])
+            for fidx in frame_indices_to_cache:
                 self._cache_frame_outputs(inference_state, fidx, obj_id_to_mask)
 
         inference_state["tracker_metadata"] = {

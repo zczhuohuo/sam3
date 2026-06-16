@@ -71,6 +71,12 @@ class Sam3BasePredictor:
                 long_video_cache_outputs=request.get(
                     "long_video_cache_outputs", False
                 ),
+                long_video_postprocess_batch_size=request.get(
+                    "long_video_postprocess_batch_size", 1
+                ),
+                long_video_grounding_batch_size=request.get(
+                    "long_video_grounding_batch_size", 4
+                ),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -141,6 +147,8 @@ class Sam3BasePredictor:
         long_video_history_frames=32,
         long_video_loader_type="auto",
         long_video_cache_outputs=False,
+        long_video_postprocess_batch_size=1,
+        long_video_grounding_batch_size=4,
     ):
         """Start a new inference session on a video directory or path."""
         if offload_video_to_cpu is None:
@@ -169,6 +177,12 @@ class Sam3BasePredictor:
             init_kwargs["long_video_history_frames"] = long_video_history_frames
             init_kwargs["long_video_loader_type"] = long_video_loader_type
             init_kwargs["long_video_cache_outputs"] = long_video_cache_outputs
+            init_kwargs[
+                "long_video_postprocess_batch_size"
+            ] = long_video_postprocess_batch_size
+            init_kwargs["long_video_grounding_batch_size"] = (
+                long_video_grounding_batch_size
+            )
             if isinstance(resource_path, str):
                 if os.path.isdir(resource_path):
                     if long_video_loader_type == "torchcodec":
@@ -201,6 +215,8 @@ class Sam3BasePredictor:
                 "history_frames": int(long_video_history_frames),
                 "loader_type": long_video_loader_type,
                 "cache_outputs": bool(long_video_cache_outputs),
+                "postprocess_batch_size": int(long_video_postprocess_batch_size),
+                "grounding_batch_size": int(long_video_grounding_batch_size),
             },
         )
 
@@ -335,6 +351,9 @@ class Sam3BasePredictor:
         try:
             session = self._get_session(session_id)
             inference_state = session["state"]
+            restore_runtime_overrides = self._apply_long_video_runtime_overrides(
+                inference_state
+            )
             self._extend_expiration_time(session)
             if propagation_direction not in ["both", "forward", "backward"]:
                 raise ValueError(
@@ -371,7 +390,39 @@ class Sam3BasePredictor:
                     self._prune_long_video_state(inference_state, frame_idx, True)
                     yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
+            if "restore_runtime_overrides" in locals():
+                restore_runtime_overrides()
             logger.info(f"propagation ended in session {session_id}")
+
+    def _apply_long_video_runtime_overrides(self, inference_state):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return lambda: None
+
+        overrides = {
+            "postprocess_batch_size": int(
+                long_video.get("postprocess_batch_size", 1)
+            ),
+            "batched_grounding_batch_size": int(
+                long_video.get("grounding_batch_size", 4)
+            ),
+        }
+        original_values = {}
+        for attr_name, override_value in overrides.items():
+            if override_value < 1 or not hasattr(self.model, attr_name):
+                continue
+            original_values[attr_name] = getattr(self.model, attr_name)
+            setattr(
+                self.model,
+                attr_name,
+                min(original_values[attr_name], override_value),
+            )
+
+        def restore():
+            for attr_name, original_value in original_values.items():
+                setattr(self.model, attr_name, original_value)
+
+        return restore
 
     def _prune_long_video_state(self, inference_state, frame_idx, reverse):
         long_video = inference_state.get("long_video") or {}
