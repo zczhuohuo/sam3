@@ -218,6 +218,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         long_video_cache_outputs=False,
         long_video_postprocess_batch_size=None,
         long_video_grounding_batch_size=None,
+        offload_state_to_cpu=False,
     ):
         # Initialize inference state (inlined from Sam3DemoMixin.init_state)
         if use_torchcodec:
@@ -241,6 +242,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
         inference_state["device"] = torch.device("cuda")
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
         inference_state["orig_height"] = orig_height
         inference_state["orig_width"] = orig_width
         inference_state["constants"] = {}
@@ -1863,10 +1865,12 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         long_video_cache_outputs=False,
         long_video_postprocess_batch_size=None,
         long_video_grounding_batch_size=None,
+        offload_state_to_cpu=False,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=async_loading_frames,
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
@@ -2256,10 +2260,12 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         long_video_cache_outputs=False,
         long_video_postprocess_batch_size=None,
         long_video_grounding_batch_size=None,
+        offload_state_to_cpu=False,
     ):
         inference_state = super().init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=async_loading_frames,
             use_torchcodec=use_torchcodec,
             use_cv2=use_cv2,
@@ -2295,6 +2301,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
     def cancel_propagation(self, inference_state):

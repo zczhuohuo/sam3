@@ -379,6 +379,9 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=False,
                 ):
+                    self._maintain_long_video_active_objects(
+                        inference_state, frame_idx, outputs, False
+                    )
                     self._prune_long_video_state(inference_state, frame_idx, False)
                     yield {"frame_index": frame_idx, "outputs": outputs}
             # Backward propagation
@@ -387,6 +390,9 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=True,
                 ):
+                    self._maintain_long_video_active_objects(
+                        inference_state, frame_idx, outputs, True
+                    )
                     self._prune_long_video_state(inference_state, frame_idx, True)
                     yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
@@ -422,6 +428,96 @@ class Sam3BasePredictor:
                 setattr(self.model, attr_name, original_value)
 
         return restore
+
+    def _maintain_long_video_active_objects(
+        self, inference_state, frame_idx, outputs, reverse
+    ):
+        long_video = inference_state.get("long_video") or {}
+        if not long_video.get("enabled", False):
+            return
+        if not hasattr(self.model, "remove_object"):
+            return
+
+        tracker_metadata = inference_state.get("tracker_metadata")
+        if not isinstance(tracker_metadata, dict):
+            return
+
+        tracked_obj_ids = self._normalize_long_video_obj_ids(
+            tracker_metadata.get("obj_ids_all_gpu")
+        )
+        if not tracked_obj_ids:
+            return
+
+        history_frames = int(long_video.get("history_frames", 32))
+        first_seen = long_video.setdefault("object_first_seen_frame", {})
+        last_output = long_video.setdefault("object_last_output_frame", {})
+        removed = long_video.setdefault("removed_inactive_object_ids", set())
+
+        for obj_id in tracked_obj_ids:
+            if obj_id not in removed:
+                first_seen.setdefault(obj_id, frame_idx)
+
+        for obj_id in self._extract_long_video_output_obj_ids(outputs):
+            if obj_id not in removed:
+                first_seen.setdefault(obj_id, frame_idx)
+                last_output[obj_id] = frame_idx
+
+        stale_obj_ids = []
+        for obj_id in tracked_obj_ids:
+            if obj_id in removed:
+                continue
+            reference_frame = last_output.get(obj_id, first_seen.get(obj_id, frame_idx))
+            if self._long_video_object_is_stale(
+                reference_frame, frame_idx, history_frames, reverse
+            ):
+                stale_obj_ids.append(obj_id)
+
+        for obj_id in stale_obj_ids:
+            self.model.remove_object(
+                inference_state,
+                obj_id,
+                frame_idx=None,
+                is_user_action=False,
+            )
+            removed.add(obj_id)
+            first_seen.pop(obj_id, None)
+            last_output.pop(obj_id, None)
+
+    def _long_video_object_is_stale(
+        self, reference_frame, frame_idx, history_frames, reverse
+    ):
+        if reverse:
+            return reference_frame > frame_idx + history_frames - 1
+        return reference_frame < frame_idx - history_frames + 1
+
+    def _extract_long_video_output_obj_ids(self, outputs):
+        if not isinstance(outputs, dict):
+            return []
+        return self._normalize_long_video_obj_ids(outputs.get("out_obj_ids"))
+
+    def _normalize_long_video_obj_ids(self, obj_ids):
+        if obj_ids is None:
+            return []
+        if isinstance(obj_ids, torch.Tensor):
+            obj_ids = obj_ids.detach().cpu()
+        if hasattr(obj_ids, "tolist"):
+            obj_ids = obj_ids.tolist()
+        if not isinstance(obj_ids, (list, tuple, set)):
+            obj_ids = [obj_ids]
+
+        normalized = []
+        for obj_id in obj_ids:
+            if isinstance(obj_id, (list, tuple)):
+                normalized.extend(self._normalize_long_video_obj_ids(obj_id))
+                continue
+            if hasattr(obj_id, "item"):
+                obj_id = obj_id.item()
+            try:
+                obj_id = int(obj_id)
+            except (TypeError, ValueError):
+                continue
+            normalized.append(obj_id)
+        return normalized
 
     def _prune_long_video_state(self, inference_state, frame_idx, reverse):
         long_video = inference_state.get("long_video") or {}

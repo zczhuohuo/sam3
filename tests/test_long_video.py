@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 import torch
 from PIL import Image
 
@@ -227,6 +228,150 @@ def test_streaming_long_video_state_stays_bounded():
     assert predictor.model.batched_grounding_batch_size == 16
 
 
+class ActiveObjectWindowFakeModel:
+    def __init__(self, frames):
+        self.frames = frames
+        self.removed_objects = []
+
+    def init_state(
+        self,
+        resource_path,
+        long_video_mode=False,
+        long_video_history_frames=32,
+        **kwargs,
+    ):
+        return {
+            "long_video": {
+                "enabled": long_video_mode,
+                "history_frames": long_video_history_frames,
+                "cache_outputs": False,
+            },
+            "tracker_metadata": {
+                "obj_ids_all_gpu": np.array([], dtype=np.int64),
+            },
+            "output_dict": {
+                "cond_frame_outputs": {},
+                "non_cond_frame_outputs": {},
+            },
+        }
+
+    def propagate_in_video(
+        self,
+        inference_state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        for frame_idx, out_obj_ids, tracked_obj_ids in self.frames:
+            inference_state["tracker_metadata"]["obj_ids_all_gpu"] = np.array(
+                tracked_obj_ids, dtype=np.int64
+            )
+            yield frame_idx, {
+                "out_obj_ids": np.array(out_obj_ids, dtype=np.int64),
+                "out_binary_masks": np.zeros((len(out_obj_ids), 1, 1), dtype=bool),
+            }
+
+    def remove_object(
+        self,
+        inference_state,
+        obj_id,
+        frame_idx,
+        is_user_action=False,
+    ):
+        self.removed_objects.append((obj_id, frame_idx, is_user_action))
+        obj_ids = inference_state["tracker_metadata"]["obj_ids_all_gpu"]
+        inference_state["tracker_metadata"]["obj_ids_all_gpu"] = obj_ids[
+            obj_ids != obj_id
+        ]
+        return None
+
+
+def test_long_video_active_window_removes_disappeared_objects():
+    predictor = Sam3BasePredictor()
+    predictor.model = ActiveObjectWindowFakeModel(
+        [
+            (0, [1], [1]),
+            (1, [1], [1]),
+            (2, [], [1]),
+            (3, [], [1]),
+        ]
+    )
+    predictor.start_session(
+        "video.mp4",
+        session_id="s",
+        long_video_mode=True,
+        long_video_history_frames=2,
+    )
+
+    outputs = list(
+        predictor.propagate_in_video("s", propagation_direction="forward")
+    )
+
+    assert [out["frame_index"] for out in outputs] == [0, 1, 2, 3]
+    assert outputs[0]["outputs"]["out_obj_ids"].tolist() == [1]
+    assert outputs[1]["outputs"]["out_obj_ids"].tolist() == [1]
+    assert predictor.model.removed_objects == [(1, None, False)]
+
+
+def test_long_video_active_window_keeps_recently_output_objects():
+    predictor = Sam3BasePredictor()
+    predictor.model = ActiveObjectWindowFakeModel(
+        [
+            (0, [2], [2]),
+            (1, [2], [2]),
+            (2, [2], [2]),
+            (3, [2], [2]),
+        ]
+    )
+    predictor.start_session(
+        "video.mp4",
+        session_id="s",
+        long_video_mode=True,
+        long_video_history_frames=2,
+    )
+
+    list(predictor.propagate_in_video("s", propagation_direction="forward"))
+
+    assert predictor.model.removed_objects == []
+
+
+def test_long_video_active_window_graces_objects_without_outputs():
+    predictor = Sam3BasePredictor()
+    predictor.model = ActiveObjectWindowFakeModel(
+        [
+            (0, [], [3]),
+            (1, [], [3]),
+            (2, [], [3]),
+        ]
+    )
+    predictor.start_session(
+        "video.mp4",
+        session_id="s",
+        long_video_mode=True,
+        long_video_history_frames=2,
+    )
+
+    list(predictor.propagate_in_video("s", propagation_direction="forward"))
+
+    assert predictor.model.removed_objects == [(3, None, False)]
+
+
+def test_long_video_active_window_is_disabled_outside_long_video_mode():
+    predictor = Sam3BasePredictor()
+    predictor.model = ActiveObjectWindowFakeModel(
+        [
+            (0, [4], [4]),
+            (1, [], [4]),
+            (2, [], [4]),
+        ]
+    )
+    predictor.start_session("video.mp4", session_id="s", long_video_mode=False)
+
+    list(predictor.propagate_in_video("s", propagation_direction="forward"))
+
+    assert predictor.model.removed_objects == []
+
+
 def test_long_video_runtime_overrides_are_opt_in():
     predictor = Sam3BasePredictor()
     predictor.model = StreamingFakeModel()
@@ -344,6 +489,7 @@ def test_multiplex_interactivity_init_forwards_long_video_loader_options(
     state = model.init_state(
         resource_path="clip.mp4",
         offload_video_to_cpu=True,
+        offload_state_to_cpu=True,
         async_loading_frames=True,
         long_video_mode=True,
         long_video_history_frames=7,
@@ -358,6 +504,7 @@ def test_multiplex_interactivity_init_forwards_long_video_loader_options(
     assert captured["offload_video_to_cpu"] is True
     assert captured["async_loading_frames"] is True
     assert state["num_frames"] == 3
+    assert state["offload_state_to_cpu"] is True
     assert state["long_video"] == {
         "enabled": True,
         "history_frames": 7,
@@ -366,3 +513,28 @@ def test_multiplex_interactivity_init_forwards_long_video_loader_options(
         "postprocess_batch_size": 2,
         "grounding_batch_size": 5,
     }
+
+
+def test_multiplex_inner_tracker_receives_offload_state_to_cpu():
+    captured = {}
+
+    class FakeTracker:
+        def init_state(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+    model = object.__new__(Sam3MultiplexTrackingWithInteractivity)
+    model.tracker = FakeTracker()
+
+    result = model._init_new_sam2_state(
+        {
+            "feature_cache": {},
+            "orig_height": 10,
+            "orig_width": 20,
+            "num_frames": 3,
+            "offload_state_to_cpu": True,
+        }
+    )
+
+    assert result == {"ok": True}
+    assert captured["offload_state_to_cpu"] is True
